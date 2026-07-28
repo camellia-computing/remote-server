@@ -1,0 +1,11 @@
+/target/
+/.env
+/id_ed25519
+/id_ed25519.pub
+/camellia-remote.sqlite3
+/camellia-remote.sqlite3-shm
+/camellia-remote.sqlite3-wal
+.DS_Store
+.vscode
+/test.*
+.idea

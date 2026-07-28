@@ -1,0 +1,8 @@
+.git
+.github
+target
+*.sqlite3
+.env
+deploy
+docs
+tests

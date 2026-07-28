@@ -1,0 +1,41 @@
+[Unit]
+Description=Camellia Remote Identity and Rendezvous Service
+Documentation=https://github.com/camellia-computing/remote-server
+After=network-online.target camellia-remote-relay.service
+Wants=network-online.target camellia-remote-relay.service
+
+[Service]
+Type=simple
+User=camellia-remote
+Group=camellia-remote
+EnvironmentFile=/etc/camellia-remote/server.env
+WorkingDirectory=/var/lib/camellia-remote
+ExecStart=/usr/local/bin/camellia-remote-identity
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+StateDirectory=camellia-remote
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/camellia-remote
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

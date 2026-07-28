@@ -1,0 +1,75 @@
+name: camellia-remote
+
+x-service: &service
+  image: ${CAMELLIA_REMOTE_SERVER_IMAGE:?Set an immutable Camellia Remote Server image digest}
+  user: "10001:10001"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  restart: unless-stopped
+  stop_grace_period: 30s
+  volumes:
+    - server-state:/var/lib/camellia-remote
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  networks:
+    - remote
+
+services:
+  relay:
+    <<: *service
+    command:
+      - camellia-remote-relay
+      - --key
+      - _
+    ports:
+      - ${CAMELLIA_REMOTE_BIND_IP:-0.0.0.0}:21117:21117
+      - ${CAMELLIA_REMOTE_BIND_IP:-0.0.0.0}:21119:21119
+    healthcheck:
+      test: ["CMD", "camellia-remote-utils", "healthcheck", "127.0.0.1:21117"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  identity:
+    <<: *service
+    environment:
+      CAMELLIA_REMOTE_API_SERVER: ${CAMELLIA_REMOTE_API_SERVER:?Set the management API origin}
+      CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE: /run/secrets/device_verification_token
+    secrets:
+      - device_verification_token
+    command:
+      - camellia-remote-identity
+      - --key
+      - _
+      - --relay-servers
+      - ${CAMELLIA_REMOTE_RELAY_ADDRESS:?Set the public relay host:port}
+    ports:
+      - ${CAMELLIA_REMOTE_BIND_IP:-0.0.0.0}:21115:21115
+      - ${CAMELLIA_REMOTE_BIND_IP:-0.0.0.0}:21116:21116
+      - ${CAMELLIA_REMOTE_BIND_IP:-0.0.0.0}:21116:21116/udp
+      - ${CAMELLIA_REMOTE_BIND_IP:-0.0.0.0}:21118:21118
+    depends_on:
+      relay:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "camellia-remote-utils", "healthcheck", "127.0.0.1:21116"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  remote:
+
+volumes:
+  server-state:
+    name: camellia-remote-server-state
+
+secrets:
+  device_verification_token:
+    file: ${CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE:?Set the shared API verification secret file}
