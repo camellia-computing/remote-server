@@ -10,7 +10,7 @@ from validate_source_provenance import (
 
 
 REPOSITORY = Path(__file__).resolve().parent.parent
-COMMIT = "2daff94dc8d4dae97b04ff47563f70842c47e28b"
+COMMIT = "a" * 40
 
 
 def document(commit: object = COMMIT) -> dict[str, object]:
