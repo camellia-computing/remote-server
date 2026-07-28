@@ -97,17 +97,23 @@ moves a release tag.
 
 The cross-repository release decision and residual production gates are recorded in the
 [Camellia Remote production-readiness audit](https://github.com/camellia-computing/remote-client/blob/main/docs/production-readiness-audit.md).
+The exact candidate, publication, recovery, and independent-verification
+contract is documented in [the release process](docs/release-process.md).
 
 Pull requests and `main` pushes run formatting, Clippy, all tests, metadata
-checks, the production image build, Compose validation, and systemd hardening
-checks. The manual Release workflow accepts only a commit reachable from
-`main`; publication additionally requires a successful push CI run and the
-protected `release` environment.
+checks, release-state-machine regression tests, the production image build,
+vulnerability scanning, Compose validation, systemd hardening checks, and one
+stable `CI / Required` aggregate gate. The manual Release workflow accepts only
+a commit reachable from `main`; publication additionally requires the trusted
+default-branch workflow, a successful push CI run, validated hosted policy, and
+the protected `release` environment.
 
 A published run builds a deterministic native bundle, publishes a multi-
-architecture GHCR image with SBOM and provenance, signs its immutable digest
-with keyless Cosign, attests release files, and creates the canonical
-`vMAJOR.MINOR.PATCH` GitHub Release. Moving tags, mutable `latest` aliases,
+architecture GHCR image by digest with SBOM and provenance, signs the digest
+with keyless Cosign, attests release files, and has the Release App create and
+read back the canonical immutable `vMAJOR.MINOR.PATCH` GitHub Release. The
+Linux archive explicitly uses provenance-only trust and no platform
+certificate. Moving tags, overwriting image aliases, mutable `latest` aliases,
 and rebuilding published assets are not part of the release contract.
 
 ## License and provenance

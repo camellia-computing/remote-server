@@ -67,6 +67,11 @@ jobs:
           submodules: recursive
       - name: Lint workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Validate release state machines
+        run: |
+          bash .github/scripts/tests/test_image_reconciliation.sh
+          bash .github/scripts/tests/test_release_publication.sh
+          shellcheck .github/scripts/*.sh .github/scripts/tests/*.sh
       - name: Validate systemd units
         run: systemd-analyze security --offline=yes deploy/systemd/*.service >/dev/null
       - name: Validate Compose model
@@ -103,3 +108,41 @@ jobs:
         run: |
           test "$(docker run --rm --entrypoint camellia-remote-identity camellia-remote-server:test --version)" = "camellia-remote-identity 0.1.0"
           test "$(docker run --rm --entrypoint camellia-remote-relay camellia-remote-server:test --version)" = "camellia-remote-relay 0.1.0"
+
+  required:
+    name: CI / Required
+    if: always()
+    needs:
+      - dependency-review
+      - quality
+      - deployment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce required results
+        shell: bash
+        env:
+          DEPENDENCY_REVIEW_RESULT: ${{ needs.dependency-review.result }}
+          DEPLOYMENT_RESULT: ${{ needs.deployment.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+        run: |
+          [[ "$QUALITY_RESULT" == success ]] || {
+            echo "Quality must succeed, got: $QUALITY_RESULT" >&2
+            exit 1
+          }
+          [[ "$DEPLOYMENT_RESULT" == success ]] || {
+            echo "Deployment and automation must succeed, got: $DEPLOYMENT_RESULT" >&2
+            exit 1
+          }
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            [[ "$DEPENDENCY_REVIEW_RESULT" == success ]] || {
+              echo "Dependency review must succeed, got: $DEPENDENCY_REVIEW_RESULT" >&2
+              exit 1
+            }
+          else
+            [[ "$DEPENDENCY_REVIEW_RESULT" == skipped ]] || {
+              echo "Dependency review must be skipped outside pull requests, got: $DEPENDENCY_REVIEW_RESULT" >&2
+              exit 1
+            }
+          fi
