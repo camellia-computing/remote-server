@@ -9,7 +9,7 @@
   },
   "protocol": {
     "repository": "https://github.com/camellia-computing/remote-protocol",
-    "commit": "79431969ac1026a1153434e6a8f4a8101768411c"
+    "commit": "510eeb112b0340e612db6dd03c7c1edb3cbf90fe"
   },
   "historyImported": false,
   "runtimeDataImported": false,
