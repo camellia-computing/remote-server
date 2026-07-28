@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "component": "camellia-computing/remote-server",
+  "importMethod": "git archive of the recorded source commit into a new root history",
+  "source": {
+    "repository": "https://github.com/XavierAlpha/rustdesk-server",
+    "upstreamRepository": "https://github.com/rustdesk/rustdesk-server",
+    "commit": "f2fc41f4ee66b3d302fdace761593ab6e7c0657d"
+  },
+  "protocol": {
+    "repository": "https://github.com/camellia-computing/remote-protocol",
+    "commit": "354c42c51174de3bad3097acdc8ee82247c7dbc0"
+  },
+  "historyImported": false,
+  "runtimeDataImported": false,
+  "license": "AGPL-3.0-only"
+}

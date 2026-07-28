@@ -1,0 +1,11 @@
++Camellia Remote Server
+Copyright (c) 2026 Camellia Computing.
+
+This work is derived from RustDesk Server OSS:
+https://github.com/rustdesk/rustdesk-server
+Copyright (c) RustDesk contributors and Purslane Ltd.
+
+The inherited work and Camellia modifications are distributed under the GNU
+Affero General Public License version 3 only. The full terms are in LICENSE.
+
+Third-party dependencies retain their respective copyright and license terms.
