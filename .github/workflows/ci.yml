@@ -47,7 +47,9 @@ jobs:
       - name: Validate release metadata
         run: |
           python3 scripts/test_release_metadata.py
+          python3 scripts/test_source_provenance.py
           python3 scripts/release_metadata.py
+          python3 scripts/validate_source_provenance.py
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
