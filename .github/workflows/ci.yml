@@ -88,6 +88,17 @@ jobs:
           build-args: |
             VERSION=0.1.0
             REVISION=${{ github.sha }}
+      - name: Vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: camellia-remote-server:test
+          version: v0.70.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          timeout: 10m0s
       - name: Exercise image binaries
         run: |
           test "$(docker run --rm --entrypoint camellia-remote-identity camellia-remote-server:test --version)" = "camellia-remote-identity 0.1.0"
