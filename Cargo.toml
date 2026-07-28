@@ -34,7 +34,7 @@ lazy_static = "1.4"
 clap = { version = "4.5", features = ["string"] }
 rust-ini = "0.21"
 base64 = "0.22"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 deadpool = "0.12"
 async-trait = "0.1"
 async-speed-limit = { git = "https://github.com/open-trade/async-speed-limit", rev = "8d1851d967b1014eb263bae23053a0e513431a9f" }
