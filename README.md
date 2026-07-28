@@ -122,4 +122,5 @@ Camellia changes and the inherited server code are licensed
 [AGPL-3.0-only](LICENSE). Upstream copyright and attribution are retained in
 [NOTICE](NOTICE), with the exact import recorded in
 [SOURCE_PROVENANCE.json](SOURCE_PROVENANCE.json). Network deployment therefore
-carries AGPL source-availability obligations.
+carries AGPL source-availability obligations. Required CI rejects any mismatch
+between that record and the checked-out protocol submodule.
