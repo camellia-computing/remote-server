@@ -15,7 +15,7 @@ databases, old package names, or compatibility service units.
 | `camellia-remote-relay` | encrypted session relay and WebSocket relay | 21117/TCP, 21119/TCP |
 | `camellia-remote-utils` | key generation, key validation, diagnostics and TCP health checks | none |
 
-Build and verify the exact locked graph with Rust 1.93.0:
+Build and verify the exact locked graph with Rust 1.97.1:
 
 ```bash
 cargo build --locked --release --bins

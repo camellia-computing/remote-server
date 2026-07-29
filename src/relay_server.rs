@@ -6,6 +6,7 @@ use camellia_remote_protocol::{
     anyhow::Context as _,
     bail,
     bytes::{Bytes, BytesMut},
+    crypto::sign,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
     protobuf::Message as _,
@@ -22,7 +23,6 @@ use camellia_remote_protocol::{
     },
     ResultType,
 };
-use sodiumoxide::crypto::sign;
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
@@ -612,6 +612,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
     });
 }
 
+// Tungstenite requires its server callback to return a full HTTP response on
+// failure; that external API fixes the otherwise-large error representation.
+#[allow(clippy::result_large_err)]
 async fn make_pair(
     stream: TcpStream,
     mut addr: SocketAddr,
