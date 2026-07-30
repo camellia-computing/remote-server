@@ -1,6 +1,5 @@
 [Unit]
 Description=Camellia Remote Relay Service
-Documentation=https://github.com/camellia-computing/remote-server
 After=network-online.target
 Wants=network-online.target
 

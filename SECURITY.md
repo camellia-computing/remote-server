@@ -1,7 +1,7 @@
-+# Security policy
+# Security policy
 
-Report suspected vulnerabilities privately through GitHub Security Advisories
-for `camellia-computing/remote-server`. Do not open a public issue containing
+Use this repository's **Security → Report a vulnerability** flow to report
+suspected vulnerabilities privately. Do not open a public issue containing
 credentials, private keys, exploit details, customer addresses, or recordings.
 
 Only the current unreleased `main` baseline is supported. Reports should

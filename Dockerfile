@@ -13,7 +13,8 @@ FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bb
 
 ARG VERSION=0.1.0
 ARG REVISION=unknown
-ARG SOURCE_URL=https://github.com/camellia-computing/remote-server
+ARG SOURCE_URL
+RUN test -n "$SOURCE_URL"
 LABEL org.opencontainers.image.title="Camellia Remote Server" \
       org.opencontainers.image.description="Identity, rendezvous and relay services for Camellia Remote" \
       org.opencontainers.image.version="$VERSION" \
