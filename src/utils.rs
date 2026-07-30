@@ -1,10 +1,11 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use camellia_remote_protocol::{
     anyhow::{anyhow, Context as _},
-    bail, ResultType,
+    bail,
+    crypto::sign,
+    ResultType,
 };
 use dns_lookup::{lookup_addr, lookup_host};
-use sodiumoxide::crypto::sign;
 use std::{
     env,
     net::{IpAddr, TcpStream, ToSocketAddrs as _},

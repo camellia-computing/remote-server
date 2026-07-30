@@ -2,18 +2,16 @@ use crate::common::*;
 use crate::peer::*;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use camellia_remote_protocol::anyhow::{anyhow, Context as _};
-use camellia_remote_protocol::sodiumoxide::{
-    crypto::{box_, secretbox},
-    randombytes::randombytes,
-};
 use camellia_remote_protocol::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
     config,
+    crypto::{box_, secretbox, sign},
     futures::future::join_all,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
     protobuf::{Message as _, MessageField},
+    rand::{rngs::OsRng, RngCore},
     rendezvous_proto::{
         register_pk_response::Result::{INVALID_ID_FORMAT, TOO_FREQUENT, UUID_MISMATCH},
         *,
@@ -33,7 +31,6 @@ use camellia_remote_protocol::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -705,7 +702,7 @@ impl RendezvousServer {
                 if !Self::valid_peer_id(&rp.id) {
                     return true;
                 }
-                log::trace!("New peer registered via tcp/ws: {:?} {:?}", &rp.id, &addr);
+                log::trace!("New peer registered via tcp/ws: {:?} {:?}", rp.id, addr);
                 self.cache_sink(addr, sink).await;
                 let (resp, cu) = match self.register_peer_common(rp, addr).await {
                     Ok(result) => result,
@@ -1168,8 +1165,8 @@ impl RendezvousServer {
         log::debug!(
             "{} punch hole response to {:?} from {:?}",
             if is_udp { "UDP" } else { "TCP" },
-            &addr_a,
-            &addr
+            addr_a,
+            addr
         );
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
@@ -1208,7 +1205,7 @@ impl RendezvousServer {
             )
             .await?;
         let addr_a = pending.requester;
-        log::debug!("TCP local addrs response to {:?} from {:?}", &addr_a, &addr);
+        log::debug!("TCP local addrs response to {:?} from {:?}", addr_a, addr);
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
@@ -1238,7 +1235,9 @@ impl RendezvousServer {
             bail!("Pending rendezvous response capacity reached");
         }
         loop {
-            let token = Bytes::from(randombytes(RENDEZVOUS_TOKEN_LEN));
+            let mut token_bytes = [0u8; RENDEZVOUS_TOKEN_LEN];
+            OsRng.fill_bytes(&mut token_bytes);
+            let token = Bytes::copy_from_slice(&token_bytes);
             if !pending.contains_key(&token) {
                 pending.insert(
                     token.clone(),
@@ -2113,12 +2112,11 @@ impl RendezvousServer {
                             });
                             stream.send(&msg_out).await.ok();
                         }
-                        Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                        Some(rendezvous_message::Union::OnlineRequest(or))
                             if or.peers.len() <= ONLINE_QUERY_MAX_PEERS
-                                && or.peers.iter().all(|id| Self::valid_peer_id(id))
-                            {
-                                allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
-                            }
+                                && or.peers.iter().all(|id| Self::valid_peer_id(id)) =>
+                        {
+                            allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
                         }
                         _ => {}
                     }
@@ -2265,6 +2263,9 @@ impl RendezvousServer {
         Ok(secretbox::Key(bytes))
     }
 
+    // Tungstenite requires its server callback to return a full HTTP response on
+    // failure; that external API fixes the otherwise-large error representation.
+    #[allow(clippy::result_large_err)]
     #[inline]
     async fn handle_listener_inner(
         &mut self,
@@ -2338,7 +2339,10 @@ impl RendezvousServer {
                 let mut ws_encrypt_out = ws_encrypt_out;
                 while let Some(msg) = rx.recv().await {
                     if let Ok(bytes) = msg.write_to_bytes() {
-                        let bytes = ws_encrypt_out.enc(&bytes);
+                        let Ok(bytes) = ws_encrypt_out.enc(&bytes) else {
+                            log::warn!("Unable to encrypt rendezvous WebSocket message");
+                            break;
+                        };
                         if ws_sink
                             .send(tungstenite::Message::Binary(bytes.into()))
                             .await

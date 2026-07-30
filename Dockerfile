@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382 AS builder
+FROM rust:1.97.1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 
 WORKDIR /build
 COPY . .
@@ -13,7 +13,8 @@ FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bb
 
 ARG VERSION=0.1.0
 ARG REVISION=unknown
-ARG SOURCE_URL=https://github.com/camellia-computing/remote-server
+ARG SOURCE_URL
+RUN test -n "$SOURCE_URL"
 LABEL org.opencontainers.image.title="Camellia Remote Server" \
       org.opencontainers.image.description="Identity, rendezvous and relay services for Camellia Remote" \
       org.opencontainers.image.version="$VERSION" \

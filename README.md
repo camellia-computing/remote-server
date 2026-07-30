@@ -15,7 +15,7 @@ databases, old package names, or compatibility service units.
 | `camellia-remote-relay` | encrypted session relay and WebSocket relay | 21117/TCP, 21119/TCP |
 | `camellia-remote-utils` | key generation, key validation, diagnostics and TCP health checks | none |
 
-Build and verify the exact locked graph with Rust 1.93.0:
+Build and verify the exact locked graph with Rust 1.97.1:
 
 ```bash
 cargo build --locked --release --bins
@@ -54,7 +54,7 @@ UID/GID 10001 with no capabilities, a read-only root filesystem, bounded PIDs,
 health checks, and one shared persistent state volume.
 
 ```bash
-export CAMELLIA_REMOTE_SERVER_IMAGE='ghcr.io/camellia-computing/remote-server@sha256:<digest>'
+export CAMELLIA_REMOTE_SERVER_IMAGE='ghcr.io/<owner>/<repository>@sha256:<digest>'
 export CAMELLIA_REMOTE_RELAY_ADDRESS='remote.example.com:21117'
 export CAMELLIA_REMOTE_API_SERVER='https://api.example.com'
 export CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE='/secure/device-verification-token'
@@ -95,10 +95,10 @@ moves a release tag.
 
 ## Release flow
 
-The cross-repository release decision and residual production gates are recorded in the
-[Camellia Remote production-readiness audit](https://github.com/camellia-computing/remote-client/blob/main/docs/production-readiness-audit.md).
-The exact candidate, publication, recovery, and independent-verification
-contract is documented in [the release process](docs/release-process.md).
+The companion client repository owns the cross-repository production-readiness
+audit. The exact server candidate, publication, recovery, and
+independent-verification contract is documented in
+[the release process](docs/release-process.md).
 
 Pull requests and `main` pushes run formatting, Clippy, all tests, metadata
 checks, release-state-machine regression tests, the production image build,

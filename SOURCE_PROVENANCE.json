@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "component": "camellia-computing/remote-server",
+  "component": "camellia-remote-server",
   "importMethod": "git archive of the recorded source commit into a new root history",
   "source": {
     "repository": "https://github.com/XavierAlpha/rustdesk-server",
@@ -8,8 +8,8 @@
     "commit": "f2fc41f4ee66b3d302fdace761593ab6e7c0657d"
   },
   "protocol": {
-    "repository": "https://github.com/camellia-computing/remote-protocol",
-    "commit": "2daff94dc8d4dae97b04ff47563f70842c47e28b"
+    "repository": "../remote-protocol.git",
+    "commit": "6fb11a4ee8cb446edb847d528c905a8038efff0b"
   },
   "historyImported": false,
   "runtimeDataImported": false,

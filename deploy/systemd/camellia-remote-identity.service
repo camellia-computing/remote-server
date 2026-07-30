@@ -1,6 +1,5 @@
 [Unit]
 Description=Camellia Remote Identity and Rendezvous Service
-Documentation=https://github.com/camellia-computing/remote-server
 After=network-online.target camellia-remote-relay.service
 Wants=network-online.target camellia-remote-relay.service
 

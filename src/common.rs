@@ -1,11 +1,11 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use camellia_remote_protocol::{
     anyhow::{Context, Result},
+    crypto::sign,
     log, ResultType,
 };
 use clap::{Arg, Command};
 use ini::Ini;
-use sodiumoxide::crypto::sign;
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},

@@ -57,16 +57,19 @@ increment the version for new bytes.
 Use values from `release-metadata.json`, not a mutable discovery alias:
 
 ```bash
+repository="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+source_url="$(gh repo view --json url --jq .url)"
+image="ghcr.io/${repository,,}"
 sha256sum --check SHA256SUMS
-gh attestation verify --repo camellia-computing/remote-server \
+gh attestation verify --repo "$repository" \
   camellia-remote-server-<version>-linux-x86_64.tar.gz
 cosign verify \
   --certificate-identity \
-  'https://github.com/camellia-computing/remote-server/.github/workflows/release.yml@refs/heads/main' \
+  "${source_url}/.github/workflows/release.yml@refs/heads/main" \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  'ghcr.io/camellia-computing/remote-server@sha256:<digest>'
+  "${image}@sha256:<digest>"
 docker buildx imagetools inspect \
-  'ghcr.io/camellia-computing/remote-server@sha256:<digest>'
+  "${image}@sha256:<digest>"
 ```
 
 Store the release URL, source commit, CI run, digest, approval record, checksum
