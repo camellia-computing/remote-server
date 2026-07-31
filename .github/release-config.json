@@ -1,0 +1,14 @@
+{
+  "allowed_files": [
+    "CHANGELOG.md",
+    "Cargo.lock",
+    "Cargo.toml"
+  ],
+  "container": true,
+  "logical_id": "remote-server",
+  "metadata_script": "scripts/release_metadata.py",
+  "package_name": "camellia-remote-server",
+  "schema_version": 1,
+  "title": "Camellia Remote Server",
+  "version_kind": "cargo"
+}

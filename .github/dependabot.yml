@@ -8,6 +8,8 @@ updates:
       day: "monday"
       time: "09:00"
       timezone: "Asia/Singapore"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       cargo-compatible:
@@ -27,6 +29,8 @@ updates:
       day: "monday"
       time: "09:30"
       timezone: "Asia/Singapore"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       actions:
@@ -45,6 +49,8 @@ updates:
       day: "monday"
       time: "10:00"
       timezone: "Asia/Singapore"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 3
     commit-message:
       prefix: "deps"
@@ -59,6 +65,8 @@ updates:
       day: "monday"
       time: "10:15"
       timezone: "Asia/Singapore"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 2
     commit-message:
       prefix: "deps"
