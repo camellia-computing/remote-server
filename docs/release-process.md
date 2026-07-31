@@ -62,9 +62,10 @@ Private application TLS certificates remain an operations concern and do not
 alter artifact identity. Rollback selects a previously completed digest; it
 does not rewrite a tag or database state.
 
-GitHub exposes the complete repository merge-policy fields only to a caller
-with push access. The hosted-policy check therefore uses a separate,
-repository-scoped App token with short-lived Contents write permission. That
-token is not reused for release authorization; the authorization controller
-uses the job token constrained to Contents, Actions, and pull-request read.
-Neither token receives Actions or Workflows write permission.
+GitHub exposes the complete repository merge-policy fields and draft Releases
+only to a caller with push access. Hosted policy and managed-draft lookups
+therefore use one repository-scoped App token with short-lived Contents write
+permission; the trusted authorization command performs only reads. Exact CI
+run lookups use the separate job token constrained to Contents, Actions, and
+pull-request read. Repository metadata scripts receive neither token, and no
+token receives Actions or Workflows write permission.
