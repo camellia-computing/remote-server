@@ -36,8 +36,11 @@ version, source ref, image name, or registry from a dispatch form.
 
 The first formal release is `v1.0.0`. A failed run is re-entrant: it may resume
 only the same App-authored draft or verify an already immutable publication.
-Conflicting refs, bytes, authors, approvals, digests, aliases, or evidence fail
-closed. Published tags, assets, and registry aliases are never moved.
+Before a draft records its container-digest marker, an approved recovery may
+reconcile a stranded registry alias to the newly frozen digest for that exact
+draft and source. The marker is the commit point: after it is present, alias or
+digest conflicts fail closed. Published tags, assets, and registry aliases are
+never moved.
 
 An incomplete publication must retain `release:pending`. After the exact
 immutable `release-complete:<SHA>` marker is validated, recovery accepts the
