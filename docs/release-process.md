@@ -1,76 +1,63 @@
 # Release process
 
-Camellia Remote Server has one manual workflow with two deliberately separate
-modes. `publish=false` builds the native candidate without release credentials,
-registry writes, tags, or a protected-environment approval. `publish=true` is
-the only formal publication path.
+Remote Server uses one review-driven state machine. Maintainers do not select a
+version, source ref, image name, or registry from a dispatch form.
 
-## Formal publication contract
+## State machine
 
-A formal run must use `.github/workflows/release.yml` from the default branch.
-Its source commit must be reachable from that branch and have a successful
-`push` run of `.github/workflows/ci.yml`. The configured Release App must
-confirm the hosted merge policy and immutable-Release setting before the
-protected `release` environment asks a non-initiating Remote team reviewer for
-approval.
+1. A successful `CI` run on `main` starts `Release Manager`.
+2. The Release App calculates the next stable SemVer from conventional commits,
+   updates only the reviewed version/changelog files, and opens or refreshes
+   `release/next`.
+3. The exact PR head must pass `CI / Required` and receive a current-head human
+   approval from a repository writer or administrator. Active change requests
+   block promotion.
+4. The App squash-merges the exact head, verifies the resulting `main` push CI,
+   creates an App-authored draft Release, and creates the lightweight
+   `vMAJOR.MINOR.PATCH` tag at that exact commit.
+5. The tag starts `publish-release.yml`. A manual dispatch is recovery-only and
+   accepts an existing managed tag while executing trusted control code from
+   `main`.
+6. The workflow freezes one Linux amd64/arm64 OCI layout, scans those exact
+   bytes, creates SPDX SBOM and provenance evidence, and records the pinned
+   Remote Protocol commit. Formal image construction does not import or export
+   a mutable GitHub Actions build cache.
+7. Only after the candidate is frozen does the protected `release` environment
+   authorize publication. Every configured registry receives the identical
+   digest, immutable version/full-commit aliases, and a keyless Cosign
+   signature.
+8. All release evidence is checksummed, keylessly signed, uploaded by the App,
+   downloaded again, and verified before the Release becomes immutable.
+   Completion and `latest` are then reconciled to the highest completed stable
+   version.
 
-The workflow then:
+The first formal release is `v1.0.0`. A failed run is re-entrant: it may resume
+only the same App-authored draft or verify an already immutable publication.
+Conflicting refs, bytes, authors, approvals, digests, aliases, or evidence fail
+closed. Published tags, assets, and registry aliases are never moved.
 
-1. builds a deterministic Linux x86-64 native archive from the locked graph;
-2. builds an OCI index for Linux amd64 and arm64 and pushes it by digest;
-3. scans the exact digest and verifies runtime version and OCI source labels;
-4. signs the digest with keyless Cosign under the default-branch workflow
-   identity;
-5. creates `vX.Y.Z` and `sha-<commit>` aliases only when absent, or verifies
-   that existing aliases resolve to the same signed digest;
-6. creates checksums, public release metadata, release notes, and GitHub OIDC
-   attestations;
-7. uses the Release App to create or resume an exact draft, read every asset
-   back byte-for-byte, publish it, wait for immutable state, and repeat the
-   public readback.
+## Registry contract
 
-The native archive has no platform code-signing certificate. Its explicit
-trust mode is `provenance-only`: SHA-256 plus GitHub OIDC attestation. The OCI
-digest is the deployment identity and additionally has a keyless Cosign
-signature. No private signing certificate belongs in this repository.
+`CONTAINER_REGISTRY_MAP` maps logical repository IDs to reviewed GHCR and
+Docker Hub names. Each configured target is published; an empty target is
+recorded as `not-configured` and skipped. At least one registry is required for
+this image-only service release. Docker Hub credentials are required only when
+its target is configured. Repository and organization renames therefore change
+hosted mappings, not workflow source.
 
-## Recovery and conflict handling
+Deploy `image@sha256:<digest>` from `release-evidence.json`. Do not deploy a
+floating alias. `latest` is discovery convenience only.
 
-Re-running the same version is safe only in a compatible state:
+## Signing and verification
 
-- no aliases and no Release: build and publish normally;
-- one signed immutable alias: verify it and create only the missing alias;
-- two matching signed aliases: reuse their digest after runtime and scan
-  checks;
-- compatible App-authored draft: replace draft assets, verify, and publish;
-- compatible immutable Release: perform a read-only public byte comparison and
-  succeed;
-- any mismatched digest, source label, signer, uploader, tag, title, asset,
-  checksum, note, platform set, or Release author: fail without replacement.
+Server images do not use desktop/mobile certificates. Trust consists of:
 
-An image alias or GitHub tag created outside this workflow is not adopted.
-Published assets, tags, and image aliases are never moved to repair a release;
-increment the version for new bytes.
+- the immutable OCI digest and exact amd64/arm64 platform digests;
+- BuildKit/Syft SBOM and GitHub provenance;
+- keyless Cosign signatures bound to `publish-release.yml`;
+- signed checksums and byte-for-byte GitHub Release readback; and
+- the exact `CI / Required`, Release PR, reviewer, and environment records.
 
-## Independent verification
-
-Use values from `release-metadata.json`, not a mutable discovery alias:
-
-```bash
-repository="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
-source_url="$(gh repo view --json url --jq .url)"
-image="ghcr.io/${repository,,}"
-sha256sum --check SHA256SUMS
-gh attestation verify --repo "$repository" \
-  camellia-remote-server-<version>-linux-x86_64.tar.gz
-cosign verify \
-  --certificate-identity \
-  "${source_url}/.github/workflows/release.yml@refs/heads/main" \
-  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  "${image}@sha256:<digest>"
-docker buildx imagetools inspect \
-  "${image}@sha256:<digest>"
-```
-
-Store the release URL, source commit, CI run, digest, approval record, checksum
-result, attestation result, and Cosign result in the release evidence record.
+Private application TLS certificates remain an operations concern and do not
+alter artifact identity. Rollback selects a previously completed digest; it
+does not rewrite a tag or database state.
