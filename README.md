@@ -103,18 +103,19 @@ independent-verification contract is documented in
 Pull requests and `main` pushes run formatting, Clippy, all tests, metadata
 checks, release-state-machine regression tests, the production image build,
 vulnerability scanning, Compose validation, systemd hardening checks, and one
-stable `CI / Required` aggregate gate. The manual Release workflow accepts only
-a commit reachable from `main`; publication additionally requires the trusted
-default-branch workflow, a successful push CI run, validated hosted policy, and
-the protected `release` environment.
+stable `CI / Required` aggregate gate. A successful `main` CI lets the Release
+App open a generated `release/next` PR; exact-head CI and human approval are
+required before its SHA-guarded squash merge. The App then prepares the draft
+Release and lightweight stable tag.
 
-A published run builds a deterministic native bundle, publishes a multi-
-architecture GHCR image by digest with SBOM and provenance, signs the digest
-with keyless Cosign, attests release files, and has the Release App create and
-read back the canonical immutable `vMAJOR.MINOR.PATCH` GitHub Release. The
-Linux archive explicitly uses provenance-only trust and no platform
-certificate. Moving tags, overwriting image aliases, mutable `latest` aliases,
-and rebuilding published assets are not part of the release contract.
+The tag workflow freezes one multi-architecture OCI layout, scans it, produces
+SBOM/provenance and protocol-dependency evidence, then enters the protected
+`release` environment. Each registry configured in the reviewed logical map is
+published by the same digest and keylessly signed. GitHub Release assets are
+signed and read back before immutable completion. `latest` is reconciled only
+to the highest completed version and is never a deployment input. Full
+state-machine and recovery rules are in
+[the release process](docs/release-process.md).
 
 ## License and provenance
 
