@@ -156,7 +156,6 @@ jobs:
           ACTIONS_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
-          RELEASE_REPOSITORY_ROOT: ${{ github.workspace }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           VERSION: ${{ needs.metadata.outputs.version }}
@@ -450,7 +449,6 @@ jobs:
           ACTIONS_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
-          RELEASE_REPOSITORY_ROOT: ${{ github.workspace }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           VERSION: ${{ needs.metadata.outputs.version }}
@@ -509,7 +507,6 @@ jobs:
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
           RELEASE_ID: ${{ steps.release.outputs.release-id }}
           RELEASE_PR_NUMBER: ${{ steps.release.outputs.release-pr-number }}
-          RELEASE_REPOSITORY_ROOT: ${{ github.workspace }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
           RELEASE_SIGNING_IDENTITY: ${{ needs.metadata.outputs.signing-identity }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
@@ -523,7 +520,6 @@ jobs:
           ACTIONS_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
-          RELEASE_REPOSITORY_ROOT: ${{ github.workspace }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           VERSION: ${{ needs.metadata.outputs.version }}
@@ -538,7 +534,6 @@ jobs:
           ACTIONS_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
-          RELEASE_REPOSITORY_ROOT: ${{ github.workspace }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           VERSION: ${{ needs.metadata.outputs.version }}
