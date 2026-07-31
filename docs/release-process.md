@@ -21,7 +21,8 @@ version, source ref, image name, or registry from a dispatch form.
 6. The workflow freezes one Linux amd64/arm64 OCI layout, scans those exact
    bytes, creates SPDX SBOM and provenance evidence, and records the pinned
    Remote Protocol commit. Formal image construction does not import or export
-   a mutable GitHub Actions build cache.
+   a mutable GitHub Actions build cache. Trivy scans the extracted OCI layout;
+   the original archive remains unchanged as the frozen publication input.
 7. Only after the candidate is frozen does the protected `release` environment
    authorize publication. Every configured registry receives the identical
    digest, immutable version/full-commit aliases, and a keyless Cosign
