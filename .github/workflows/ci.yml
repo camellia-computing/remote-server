@@ -90,6 +90,7 @@ jobs:
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
           bash .github/scripts/tests/test_resolve_container_registries.sh
+          bash .github/scripts/tests/test_verify_release_image.sh
           bash -n .github/scripts/publish-container-release.sh
           shellcheck .github/scripts/*.sh .github/scripts/tests/*.sh
       - name: Validate systemd units

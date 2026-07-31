@@ -9,18 +9,37 @@ revision="${3:?source revision is required}"
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
 
-docker buildx imagetools inspect --raw "$reference" |
-  jq -e '
-    [
-      .manifests[]? |
-      select(.platform.os == "linux") |
-      .platform.architecture
-    ] | sort | unique == ["amd64", "arm64"]
-  ' >/dev/null
+index_json="$(docker buildx imagetools inspect --raw "$reference")"
+jq -e '
+  [
+    .manifests[]? |
+    select(.platform.os == "linux")
+  ] as $platforms |
+  ($platforms | length) == 2 and
+  ($platforms | map(.platform.architecture) | sort) == ["amd64", "arm64"] and
+  all($platforms[];
+    .digest | type == "string" and test("^sha256:[0-9a-f]{64}$")
+  )
+' <<< "$index_json" >/dev/null
 
+repository="${reference%@*}"
 for architecture in amd64 arm64; do
-  docker pull --platform "linux/$architecture" "$reference"
-  image_id="$(docker image inspect --format '{{.Id}}' "$reference")"
+  platform_digest="$(
+    jq -er --arg architecture "$architecture" '
+      [
+        .manifests[] |
+        select(
+          .platform.os == "linux" and
+          .platform.architecture == $architecture
+        ) |
+        .digest
+      ] |
+      if length == 1 then .[0] else error("platform digest mismatch") end
+    ' <<< "$index_json"
+  )"
+  platform_reference="$repository@$platform_digest"
+  docker pull --platform "linux/$architecture" "$platform_reference"
+  image_id="$(docker image inspect --format '{{.Id}}' "$platform_reference")"
   local_tag="remote-server-release-verify:$architecture"
   docker tag "$image_id" "$local_tag"
   identity_version="$(docker run --rm --platform "linux/$architecture" \

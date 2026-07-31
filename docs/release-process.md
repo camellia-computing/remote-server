@@ -26,7 +26,9 @@ version, source ref, image name, or registry from a dispatch form.
 7. Only after the candidate is frozen does the protected `release` environment
    authorize publication. Every configured registry receives the identical
    digest, immutable version/full-commit aliases, and a keyless Cosign
-   signature.
+   signature. Runtime readback resolves each unique amd64/arm64 manifest digest
+   from that signed index and exercises it under a separate local tag; it never
+   reuses the parent index reference as two mutable local images.
 8. All release evidence is checksummed, keylessly signed, uploaded by the App,
    downloaded again, and verified before the Release becomes immutable.
    Completion and `latest` are then reconciled to the highest completed stable
