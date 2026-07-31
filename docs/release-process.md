@@ -36,6 +36,11 @@ only the same App-authored draft or verify an already immutable publication.
 Conflicting refs, bytes, authors, approvals, digests, aliases, or evidence fail
 closed. Published tags, assets, and registry aliases are never moved.
 
+An incomplete publication must retain `release:pending`. After the exact
+immutable `release-complete:<SHA>` marker is validated, recovery accepts the
+authorizing PR both immediately before and after label cleanup while still
+revalidating its identity, reviewed head, approval, merge topology and tag.
+
 ## Registry contract
 
 `CONTAINER_REGISTRY_MAP` maps logical repository IDs to reviewed GHCR and
