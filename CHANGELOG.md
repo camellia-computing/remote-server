@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.1] - 2026-08-01
+
+### Fixes
+
+- fix(release): harden candidate recovery (#12) (`d24b60c0d28f`)
+- fix(release): preserve read-only draft authorization (#13) (`132a0a034df4`)
+- fix(release): preserve managed draft visibility (#14) (`d8a8ea49deaa`)
+- fix(release): preserve completed recovery lifecycle (#16) (`f0b93a4d46eb`)
+- fix(release): scan extracted OCI layout (#17) (`b06564177350`)
+- fix(release): verify platform manifests independently (#18) (`56fbeb278f73`)
+- fix(release): reconcile incomplete registry aliases (#19) (`6a8095e3cfe6`)
+- fix(release): make completion cleanup reentrant (#20) (`10f3afd9c15a`)
+
 ## [1.0.0] - 2026-07-31
 
 ### Features
