@@ -5,6 +5,7 @@ use camellia_remote_protocol::anyhow::{anyhow, Context as _};
 use camellia_remote_protocol::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
+    bytes_codec::RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH,
     config,
     crypto::{box_, secretbox, sign},
     futures::future::join_all,
@@ -50,7 +51,6 @@ const HTTP_PROXY_RATE_PER_IP: u32 = 120;
 const HTTP_PROXY_MAX_TRACKED_IPS: usize = 4_096;
 const RENDEZVOUS_EVENT_QUEUE_CAPACITY: usize = 4_096;
 const RENDEZVOUS_CONNECTION_QUEUE_CAPACITY: usize = 64;
-const RENDEZVOUS_CONTROL_FRAME_MAX: usize = 17 * 1024 * 1024;
 const DEFAULT_MAX_RENDEZVOUS_CONNECTIONS: usize = 4_096;
 const PEER_ID_MIN_LEN: usize = 6;
 const PEER_ID_MAX_LEN: usize = 16;
@@ -2101,10 +2101,11 @@ impl RendezvousServer {
             });
             return;
         }
-        let mut stream = FramedStream::from(stream, addr);
-        stream
-            .codec_mut()
-            .set_max_packet_length(RENDEZVOUS_CONTROL_FRAME_MAX);
+        let stream = FramedStream::from_with_max_packet_length(
+            stream,
+            addr,
+            RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH,
+        );
         tokio::spawn(async move {
             let _permit = permit;
             let mut stream = stream;
@@ -2306,8 +2307,8 @@ impl RendezvousServer {
                 .read_buffer_size(16 * 1024)
                 .write_buffer_size(16 * 1024)
                 .max_write_buffer_size(1024 * 1024)
-                .max_message_size(Some(RENDEZVOUS_CONTROL_FRAME_MAX))
-                .max_frame_size(Some(RENDEZVOUS_CONTROL_FRAME_MAX));
+                .max_message_size(Some(RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH))
+                .max_frame_size(Some(RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH));
             let mut ws_stream = match timeout(
                 HANDSHAKE_WAIT_MS,
                 tokio_tungstenite::accept_hdr_async_with_config(
@@ -2396,10 +2397,11 @@ impl RendezvousServer {
             // It must proactively send a KeyExchange message to the client
             // to initiate the secure handshake. This avoids a deadlock where both
             // client and server are waiting for each other.
-            let mut stream = FramedStream::from(stream, addr);
-            stream
-                .codec_mut()
-                .set_max_packet_length(RENDEZVOUS_CONTROL_FRAME_MAX);
+            let mut stream = FramedStream::from_with_max_packet_length(
+                stream,
+                addr,
+                RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH,
+            );
 
             let _session_key = self.attempt_handshake(&mut stream).await?;
             let (tx, mut rx) =
