@@ -17,7 +17,7 @@ use camellia_remote_protocol::{
         *,
     },
     sha2::{Digest, Sha256},
-    tcp::{Encrypt, FramedStream},
+    tcp::{CipherRole, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -68,6 +68,17 @@ const PEER_CACHE_CLEANUP_INTERVAL_SECS: u64 = 300;
 const PEER_CACHE_IDLE_SECS: u64 = 600;
 const DEPLOYMENT_VERIFICATION_CACHE_SECS: u64 = 30;
 const HC_KEEP_ALIVE_SECS: i32 = 10;
+
+fn sha256_hex(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(data);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
 
 #[derive(Clone, Debug)]
 enum Data {
@@ -1523,7 +1534,7 @@ impl RendezvousServer {
         if base.is_empty() {
             bail!("API server is not configured");
         }
-        let public_key_hash = format!("{:x}", Sha256::digest(public_key));
+        let public_key_hash = sha256_hex(public_key);
         let response = self
             .inner
             .http_client
@@ -2176,17 +2187,9 @@ impl RendezvousServer {
 
         let client_pk = box_::PublicKey::from_slice(&ex.keys[0])
             .ok_or_else(|| anyhow!("Invalid rendezvous client public key"))?;
-        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
-        let symmetric = box_::open(ex.keys[1].as_ref(), &nonce, &client_pk, &tmp_sk)
-            .map_err(|_| anyhow!("Unable to decrypt rendezvous session key"))?;
-        if symmetric.len() != secretbox::KEYBYTES {
-            bail!("Invalid rendezvous session key length");
-        }
-
-        let mut bytes = [0u8; secretbox::KEYBYTES];
-        bytes.copy_from_slice(&symmetric);
-        let key = secretbox::Key(bytes);
-        stream.set_key(key.clone());
+        let key = Encrypt::decode(&ex.keys[1], client_pk.as_ref(), &tmp_sk)
+            .map_err(|err| anyhow!("Unable to decode rendezvous session key: {err}"))?;
+        stream.set_key(key.clone(), CipherRole::Responder);
         if !stream.is_secured() {
             bail!("Rendezvous stream did not enter encrypted mode");
         }
@@ -2250,17 +2253,10 @@ impl RendezvousServer {
 
         let client_pk = box_::PublicKey::from_slice(&ex.keys[0])
             .ok_or_else(|| anyhow!("Invalid rendezvous WebSocket client public key"))?;
-        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
-        let symmetric = box_::open(ex.keys[1].as_ref(), &nonce, &client_pk, &tmp_sk)
-            .map_err(|_| anyhow!("Unable to decrypt rendezvous WebSocket session key"))?;
-        if symmetric.len() != secretbox::KEYBYTES {
-            bail!("Invalid rendezvous WebSocket session key length");
-        }
-
-        let mut bytes = [0u8; secretbox::KEYBYTES];
-        bytes.copy_from_slice(&symmetric);
+        let key = Encrypt::decode(&ex.keys[1], client_pk.as_ref(), &tmp_sk)
+            .map_err(|err| anyhow!("Unable to decode rendezvous WebSocket session key: {err}"))?;
         log::debug!("Rendezvous WebSocket secure channel established");
-        Ok(secretbox::Key(bytes))
+        Ok(key)
     }
 
     // Tungstenite requires its server callback to return a full HTTP response on
@@ -2329,8 +2325,8 @@ impl RendezvousServer {
             let ws_key = self.attempt_handshake_ws(&mut ws_stream).await?;
             let (mut ws_sink, mut ws_stream) = ws_stream.split();
             let secretbox::Key(bytes) = ws_key;
-            let mut ws_encrypt_in = Encrypt::new(secretbox::Key(bytes));
-            let ws_encrypt_out = Encrypt::new(secretbox::Key(bytes));
+            let mut ws_encrypt_in = Encrypt::new(secretbox::Key(bytes), CipherRole::Responder);
+            let ws_encrypt_out = Encrypt::new(secretbox::Key(bytes), CipherRole::Responder);
 
             // bridge a rendezvous message channel to websocket sink (binary)
             let (tx, mut rx) =
@@ -2602,6 +2598,14 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_public_key_hash_uses_lowercase_sha256_hex() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn peer_ids_are_bounded_and_canonical() {
