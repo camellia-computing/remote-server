@@ -214,7 +214,7 @@ const HANDSHAKE_WAIT_MS: u64 = 8_000;
 struct Inner {
     serial: i32,
     api_server: String,
-    trust_proxy_headers: bool,
+    trusted_proxies: TrustedProxyConfig,
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: sign::SecretKey,
@@ -474,7 +474,15 @@ impl RendezvousServer {
             .build()?;
         log::info!("api_server: {}", api_server);
         let trust_proxy_headers = crate::common::get_yes_no_arg("trust-proxy-headers", false)?;
-        log::info!("trust_proxy_headers: {}", trust_proxy_headers);
+        let trusted_proxies = TrustedProxyConfig::parse(
+            trust_proxy_headers,
+            &crate::common::get_arg("trusted-proxy-cidrs"),
+        )?;
+        log::info!(
+            "trusted_proxy_headers: {}, trusted_proxy_cidrs: {}",
+            trusted_proxies.is_enabled(),
+            trusted_proxies.network_count()
+        );
         let runtime_console = crate::common::get_yes_no_arg("ENABLE_RUNTIME_CONSOLE", false)?;
         if runtime_console {
             log::warn!("Unauthenticated loopback runtime console is enabled");
@@ -509,7 +517,7 @@ impl RendezvousServer {
             inner: Arc::new(Inner {
                 serial,
                 api_server,
-                trust_proxy_headers,
+                trusted_proxies,
                 sk,
                 mask,
                 local_ip,
@@ -2315,33 +2323,32 @@ impl RendezvousServer {
         let mut sink;
         let mut health_keepalive_started = false;
         if ws {
-            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-            let trust_proxy_headers = self.inner.trust_proxy_headers;
+            use tokio_tungstenite::tungstenite::{
+                handshake::server::{ErrorResponse, Request, Response},
+                http::StatusCode,
+            };
+            let trusted_proxies = &self.inner.trusted_proxies;
             let callback = |req: &Request, response: Response| {
-                if trust_proxy_headers {
-                    // Only consulted when the operator opts in with --trust-proxy-headers.
-                    // These headers are NOT verifiable: anyone able to reach this port
-                    // directly can spoof an arbitrary IP, bypassing IP-based rate limiting
-                    // and corrupting logged addresses. Enable it only when the WebSocket
-                    // port is reachable exclusively through a reverse proxy that overwrites
-                    // them. https://github.com/rustdesk/rustdesk-server/issues/634
-                    let headers = req.headers();
-                    let real_ip = headers
-                        .get("X-Real-IP")
-                        .or_else(|| headers.get("X-Forwarded-For"))
-                        .and_then(|header_value| header_value.to_str().ok())
-                        .and_then(|value| value.split(',').next())
-                        .map(|value| value.trim())
-                        .filter(|value| !value.is_empty());
-                    if let Some(ip) = real_ip {
-                        if let Ok(real_ip_addr) = ip.parse::<IpAddr>() {
-                            // Keep the accepted TCP source port to avoid key collisions for
-                            // concurrent websocket clients from the same public IP.
-                            addr = SocketAddr::new(real_ip_addr, addr.port());
-                        }
+                match trusted_proxies.resolve_client_ip(addr.ip(), req.headers()) {
+                    Ok(client_ip) => {
+                        // Keep the accepted TCP source port to avoid key collisions for
+                        // concurrent WebSocket clients from the same public IP.
+                        addr.set_ip(client_ip);
+                        Ok(response)
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "Rejected rendezvous WebSocket proxy headers from {}: {}",
+                            addr.ip(),
+                            err
+                        );
+                        let mut error = ErrorResponse::new(Some(
+                            "Invalid proxy client address headers".to_owned(),
+                        ));
+                        *error.status_mut() = StatusCode::BAD_REQUEST;
+                        Err(error)
                     }
                 }
-                Ok(response)
             };
             let websocket_config = tungstenite::protocol::WebSocketConfig::default()
                 .read_buffer_size(16 * 1024)

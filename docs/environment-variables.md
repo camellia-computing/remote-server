@@ -8,7 +8,8 @@ Both long-lived binaries accept command-line flags and canonical environment var
 | --- | ---: | --- |
 | `CAMELLIA_REMOTE_BIND` | all interfaces | one local IPv4 or IPv6 bind address |
 | `CAMELLIA_REMOTE_KEY` | generated/loaded | explicit validated key, or `_` to use persisted key state |
-| `CAMELLIA_REMOTE_TRUST_PROXY_HEADERS` | `N` | `Y` only behind an overwriting trusted proxy |
+| `CAMELLIA_REMOTE_TRUST_PROXY_HEADERS` | `N` | `Y` requires a non-empty trusted proxy CIDR list |
+| `CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS` | empty | comma-separated final proxy IPv4/IPv6 CIDRs; `/0`, duplicates and more than 64 entries are rejected |
 | `CAMELLIA_REMOTE_LOG_FILTER` | `info` | bounded Flexi Logger filter |
 
 ## Identity service
@@ -36,3 +37,12 @@ Both long-lived binaries accept command-line flags and canonical environment var
 | `CAMELLIA_REMOTE_SINGLE_BANDWIDTH` | `16Mb` | single-IP relay limit |
 
 The included systemd and Compose definitions use these names. Configuration files containing unprefixed or obsolete keys fail closed.
+
+Proxy address headers apply only to WebSocket listeners. A TCP peer must match
+`CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS` before either header is consulted.
+`X-Forwarded-For` is parsed as a bounded chain from right to left, skipping
+trusted proxy hops until the nearest untrusted client is found; a chain made
+only of trusted proxy addresses is rejected. `X-Real-IP` is accepted as a
+single bare IP; when both headers are present their resolved client IP must
+agree. Malformed or duplicate headers from a trusted proxy reject the upgrade.
+Headers from an untrusted direct peer are ignored.

@@ -40,8 +40,10 @@ Important settings:
 - `CAMELLIA_REMOTE_RELAY_SERVERS`: public relay `host:port` values advertised to clients.
 - `CAMELLIA_REMOTE_API_SERVER`: bare management API origin. Non-loopback HTTP is rejected.
 - `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE`: shared high-entropy verification secret.
-- `CAMELLIA_REMOTE_TRUST_PROXY_HEADERS`: keep `N` unless a trusted proxy overwrites client
-  address headers.
+- `CAMELLIA_REMOTE_TRUST_PROXY_HEADERS`: keep `N` unless WebSocket ingress uses the strict
+  trusted-proxy contract.
+- `CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS`: required comma-separated IPv4/IPv6 CIDRs when proxy
+  headers are enabled; direct peers outside these networks cannot override their TCP address.
 - `CAMELLIA_REMOTE_DB_URL`: identity SQLite path. The clean default is
   `./camellia-remote.sqlite3`.
 
@@ -74,6 +76,11 @@ sudo systemctl enable --now camellia-remote-identity.service
 
 TLS should terminate at a hardened reverse proxy where WebSocket ingress is
 needed. Expose only the required ports and retain host/firewall rate controls.
+When proxy address headers are enabled, list only the final proxy hops in
+`CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS`. `X-Forwarded-For` is evaluated from right
+to left through trusted hops; if both supported headers are present they must
+identify the same client. Invalid headers from a trusted proxy reject the
+WebSocket upgrade, while headers from direct untrusted peers are ignored.
 Never put the private server key or device-verification token in an image,
 repository, log, or command history.
 
