@@ -8,9 +8,11 @@ use camellia_remote_protocol::{
     bytes_codec::RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH,
     config,
     crypto::{box_, secretbox, sign},
+    error,
     futures::future::join_all,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
+    message_proto::ErrorCode,
     protobuf::{Message as _, MessageField},
     rand::{rngs::OsRng, RngCore},
     rendezvous_proto::{
@@ -72,6 +74,15 @@ const _: () = assert!(DEPLOYMENT_VERIFICATION_CACHE_SECS <= 15);
 const DEPLOYMENT_ASSERTION_VERSION: &str = "camellia-deployment-assertion-v1";
 const DEPLOYMENT_ASSERTION_MAX_FUTURE_SECS: i64 = 60;
 const HC_KEEP_ALIVE_SECS: i32 = 10;
+
+fn http_proxy_error(status: i32, code: ErrorCode) -> HttpProxyResponse {
+    let mut response = HttpProxyResponse {
+        status,
+        ..Default::default()
+    };
+    response.typed_error = MessageField::some(error::for_code(code));
+    response
+}
 
 fn sha256_hex(data: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1073,35 +1084,19 @@ impl RendezvousServer {
             Some(rendezvous_message::Union::HttpProxyRequest(req)) => {
                 let resp = if !Self::http_proxy_authorized(true, key, &req.licence_key) {
                     log::warn!("Rejected unauthorized API proxy request from {}", addr);
-                    HttpProxyResponse {
-                        status: 403,
-                        error: "API proxy authorization failed".to_owned(),
-                        ..Default::default()
-                    }
+                    http_proxy_error(403, ErrorCode::PERMISSION_DENIED)
                 } else if !self.allow_http_proxy_request(addr.ip()).await {
-                    HttpProxyResponse {
-                        status: 429,
-                        error: "API proxy rate limit exceeded".to_owned(),
-                        ..Default::default()
-                    }
+                    http_proxy_error(429, ErrorCode::RATE_LIMITED)
                 } else {
                     match self.inner.http_proxy_slots.clone().try_acquire_owned() {
                         Ok(_permit) => match self.handle_http_proxy_request(req, addr.ip()).await {
                             Ok(resp) => resp,
                             Err(err) => {
                                 log::warn!("API proxy request from {} failed: {}", addr, err);
-                                HttpProxyResponse {
-                                    status: 502,
-                                    error: "API upstream request failed".to_owned(),
-                                    ..Default::default()
-                                }
+                                http_proxy_error(502, ErrorCode::HTTP_PROXY_FAILED)
                             }
                         },
-                        Err(_) => HttpProxyResponse {
-                            status: 503,
-                            error: "API proxy is busy".to_owned(),
-                            ..Default::default()
-                        },
+                        Err(_) => http_proxy_error(503, ErrorCode::SERVICE_BUSY),
                     }
                 };
                 let mut msg_out = RendezvousMessage::new();
@@ -3322,6 +3317,23 @@ mod tests {
             "wrong-key"
         ));
         assert!(!RendezvousServer::http_proxy_authorized(true, "", ""));
+    }
+
+    #[test]
+    fn api_proxy_failures_use_the_typed_error_contract() {
+        for (status, code) in [
+            (403, ErrorCode::PERMISSION_DENIED),
+            (429, ErrorCode::RATE_LIMITED),
+            (502, ErrorCode::HTTP_PROXY_FAILED),
+            (503, ErrorCode::SERVICE_BUSY),
+        ] {
+            let response = http_proxy_error(status, code);
+            assert_eq!(response.status, status);
+            assert!(response.error.is_empty());
+            let typed = response.typed_error.as_ref().expect("typed proxy error");
+            assert!(error::is_valid_for(typed, error::ErrorContext::HttpProxy));
+            assert_eq!(typed.code.enum_value(), Ok(code));
+        }
     }
 
     #[test]
