@@ -1,3 +1,4 @@
+use crate::common::TrustedProxyConfig;
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -54,7 +55,7 @@ struct PendingRelay {
 struct RelayContext {
     limiter: Limiter,
     key: Arc<str>,
-    trust_proxy_headers: bool,
+    trusted_proxies: TrustedProxyConfig,
     runtime_console: bool,
     connection_slots: Arc<Semaphore>,
 }
@@ -137,14 +138,18 @@ pub async fn start_with_bind(
     bind_addr: Option<IpAddr>,
     port: &str,
     key: &str,
-    trust_proxy_headers: bool,
+    trusted_proxies: TrustedProxyConfig,
 ) -> ResultType<()> {
     let key = get_server_sk(key)?;
     let runtime_console = crate::common::get_yes_no_arg("ENABLE_RUNTIME_CONSOLE", false)?;
     if runtime_console {
         log::warn!("Unauthenticated loopback runtime console is enabled");
     }
-    log::info!("trust_proxy_headers: {}", trust_proxy_headers);
+    log::info!(
+        "trusted_proxy_headers: {}, trusted_proxy_cidrs: {}",
+        trusted_proxies.is_enabled(),
+        trusted_proxies.network_count()
+    );
     *BLACKLIST.write().await = load_ip_list(BLACKLIST_FILE)?;
     log::info!(
         "#blacklist({}): {}",
@@ -185,7 +190,7 @@ pub async fn start_with_bind(
                     None
                 },
                 &key,
-                trust_proxy_headers,
+                trusted_proxies.clone(),
                 runtime_console,
                 connection_slots.clone(),
             )
@@ -522,14 +527,14 @@ async fn io_loop(
     listener2: TcpListener,
     listener_console: Option<TcpListener>,
     key: &str,
-    trust_proxy_headers: bool,
+    trusted_proxies: TrustedProxyConfig,
     runtime_console: bool,
     connection_slots: Arc<Semaphore>,
 ) {
     let context = RelayContext {
         limiter: <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _),
         key: Arc::from(key),
-        trust_proxy_headers,
+        trusted_proxies,
         runtime_console,
         connection_slots,
     };
@@ -605,10 +610,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
     }
     let key = context.key.clone();
     let limiter = context.limiter.clone();
-    let trust_proxy_headers = context.trust_proxy_headers;
+    let trusted_proxies = context.trusted_proxies.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        allow_err!(make_pair(stream, addr, key.as_ref(), limiter, ws, trust_proxy_headers).await);
+        allow_err!(make_pair(stream, addr, key.as_ref(), limiter, ws, trusted_proxies).await);
     });
 }
 
@@ -621,35 +626,33 @@ async fn make_pair(
     key: &str,
     limiter: Limiter,
     ws: bool,
-    trust_proxy_headers: bool,
+    trusted_proxies: TrustedProxyConfig,
 ) -> ResultType<()> {
     if ws {
-        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        use tokio_tungstenite::tungstenite::{
+            handshake::server::{ErrorResponse, Request, Response},
+            http::StatusCode,
+        };
         let callback = |req: &Request, response: Response| {
-            if trust_proxy_headers {
-                // Only consulted when the operator opts in with --trust-proxy-headers.
-                // These headers are NOT verifiable: anyone able to reach this port
-                // directly can spoof an arbitrary IP, bypassing IP-based rate limiting
-                // and corrupting logged addresses. Enable it only when the WebSocket
-                // port is reachable exclusively through a reverse proxy that overwrites
-                // them. https://github.com/rustdesk/rustdesk-server/issues/634
-                let headers = req.headers();
-                let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok())
-                    .and_then(|value| value.split(',').next())
-                    .map(|value| value.trim())
-                    .filter(|value| !value.is_empty());
-                if let Some(ip) = real_ip {
-                    if let Ok(real_ip_addr) = ip.parse::<IpAddr>() {
-                        // Keep the accepted TCP source port so concurrent websocket
-                        // clients behind one public IP stay distinguishable.
-                        addr = SocketAddr::new(real_ip_addr, addr.port());
-                    }
+            match trusted_proxies.resolve_client_ip(addr.ip(), req.headers()) {
+                Ok(client_ip) => {
+                    // Keep the accepted TCP source port so concurrent WebSocket
+                    // clients behind one public IP stay distinguishable.
+                    addr.set_ip(client_ip);
+                    Ok(response)
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Rejected relay WebSocket proxy headers from {}: {}",
+                        addr.ip(),
+                        err
+                    );
+                    let mut error =
+                        ErrorResponse::new(Some("Invalid proxy client address headers".to_owned()));
+                    *error.status_mut() = StatusCode::BAD_REQUEST;
+                    Err(error)
                 }
             }
-            Ok(response)
         };
         let websocket_config = tungstenite::protocol::WebSocketConfig::default()
             .read_buffer_size(32 * 1024)
@@ -670,6 +673,11 @@ async fn make_pair(
             Ok(result) => result?,
             Err(_) => bail!("Relay WebSocket upgrade timed out"),
         };
+        let client_ip = camellia_remote_protocol::try_into_v4(addr).ip().to_string();
+        if BLOCKLIST.read().await.contains(&client_ip) {
+            log::info!("{} blocked", client_ip);
+            return Ok(());
+        }
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
         let stream = FramedStream::from_with_max_packet_length(

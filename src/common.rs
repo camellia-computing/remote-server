@@ -6,14 +6,187 @@ use camellia_remote_protocol::{
 };
 use clap::{Arg, Command};
 use ini::Ini;
+use ipnetwork::IpNetwork;
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
     io::prelude::*,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Instant, SystemTime},
 };
+use tungstenite::http::HeaderMap;
+
+const MAX_TRUSTED_PROXY_CIDRS_BYTES: usize = 4 * 1024;
+const MAX_TRUSTED_PROXY_CIDRS: usize = 64;
+const MAX_FORWARDED_FOR_BYTES: usize = 4 * 1024;
+const MAX_FORWARDED_FOR_HOPS: usize = 32;
+const MAX_PROXY_IP_BYTES: usize = 64;
+
+#[derive(Clone, Debug, Default)]
+pub struct TrustedProxyConfig {
+    networks: Arc<[IpNetwork]>,
+}
+
+impl TrustedProxyConfig {
+    pub fn parse(enabled: bool, value: &str) -> ResultType<Self> {
+        let value = value.trim();
+        if !enabled {
+            if !value.is_empty() {
+                camellia_remote_protocol::bail!(
+                    "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS requires CAMELLIA_REMOTE_TRUST_PROXY_HEADERS=Y"
+                );
+            }
+            return Ok(Self::default());
+        }
+        if value.is_empty() {
+            camellia_remote_protocol::bail!(
+                "CAMELLIA_REMOTE_TRUST_PROXY_HEADERS=Y requires CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS"
+            );
+        }
+        if value.len() > MAX_TRUSTED_PROXY_CIDRS_BYTES {
+            camellia_remote_protocol::bail!(
+                "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS exceeds the {MAX_TRUSTED_PROXY_CIDRS_BYTES}-byte limit"
+            );
+        }
+
+        let mut networks = Vec::new();
+        for raw_network in value.split(',') {
+            let raw_network = raw_network.trim();
+            if raw_network.is_empty() {
+                camellia_remote_protocol::bail!(
+                    "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS contains an empty entry"
+                );
+            }
+            let parsed = raw_network
+                .parse::<IpNetwork>()
+                .with_context(|| format!("Invalid trusted proxy CIDR: {raw_network}"))?;
+            let network = IpNetwork::new(parsed.network(), parsed.prefix())
+                .with_context(|| format!("Invalid trusted proxy CIDR: {raw_network}"))?;
+            if network.prefix() == 0 {
+                camellia_remote_protocol::bail!(
+                    "Trusted proxy CIDR {raw_network} covers every address and is not allowed"
+                );
+            }
+            if networks.contains(&network) {
+                camellia_remote_protocol::bail!("Duplicate trusted proxy CIDR: {raw_network}");
+            }
+            networks.push(network);
+            if networks.len() > MAX_TRUSTED_PROXY_CIDRS {
+                camellia_remote_protocol::bail!(
+                    "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS contains more than {MAX_TRUSTED_PROXY_CIDRS} entries"
+                );
+            }
+        }
+        Ok(Self {
+            networks: networks.into(),
+        })
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.networks.is_empty()
+    }
+
+    pub fn network_count(&self) -> usize {
+        self.networks.len()
+    }
+
+    pub fn resolve_client_ip(&self, tcp_peer: IpAddr, headers: &HeaderMap) -> ResultType<IpAddr> {
+        let tcp_peer = canonical_ip(tcp_peer);
+        if !self.is_enabled() || !self.is_trusted(tcp_peer) {
+            return Ok(tcp_peer);
+        }
+
+        let real_ip = single_proxy_header(headers, "x-real-ip")?
+            .map(parse_proxy_ip)
+            .transpose()?;
+        let forwarded_for = single_proxy_header(headers, "x-forwarded-for")?
+            .map(|value| self.parse_forwarded_for(value))
+            .transpose()?;
+
+        match (real_ip, forwarded_for) {
+            (Some(real_ip), Some(forwarded_for)) if real_ip != forwarded_for => {
+                camellia_remote_protocol::bail!(
+                    "X-Real-IP and X-Forwarded-For identify different clients"
+                )
+            }
+            (Some(real_ip), _) => Ok(real_ip),
+            (_, Some(forwarded_for)) => Ok(forwarded_for),
+            (None, None) => Ok(tcp_peer),
+        }
+    }
+
+    fn is_trusted(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
+        self.networks.iter().any(|network| network.contains(ip))
+    }
+
+    fn parse_forwarded_for(&self, value: &str) -> ResultType<IpAddr> {
+        if value.len() > MAX_FORWARDED_FOR_BYTES {
+            camellia_remote_protocol::bail!(
+                "X-Forwarded-For exceeds the {MAX_FORWARDED_FOR_BYTES}-byte limit"
+            );
+        }
+        let mut hops = Vec::new();
+        for raw_hop in value.split(',') {
+            if hops.len() >= MAX_FORWARDED_FOR_HOPS {
+                camellia_remote_protocol::bail!(
+                    "X-Forwarded-For contains more than {MAX_FORWARDED_FOR_HOPS} hops"
+                );
+            }
+            hops.push(parse_proxy_ip(raw_hop)?);
+        }
+        for hop in hops.into_iter().rev() {
+            if !self.is_trusted(hop) {
+                return Ok(hop);
+            }
+        }
+        camellia_remote_protocol::bail!(
+            "X-Forwarded-For does not contain a client outside the trusted proxy networks"
+        )
+    }
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ipv6) => ipv6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ipv6)),
+        ip => ip,
+    }
+}
+
+fn parse_proxy_ip(value: &str) -> ResultType<IpAddr> {
+    let value = value.trim();
+    if value.is_empty() {
+        camellia_remote_protocol::bail!("Proxy client address contains an empty IP entry");
+    }
+    if value.len() > MAX_PROXY_IP_BYTES {
+        camellia_remote_protocol::bail!(
+            "Proxy client address exceeds the {MAX_PROXY_IP_BYTES}-byte limit"
+        );
+    }
+    value
+        .parse::<IpAddr>()
+        .map(canonical_ip)
+        .with_context(|| format!("Invalid proxy client IP: {value}"))
+}
+
+fn single_proxy_header<'a>(headers: &'a HeaderMap, name: &str) -> ResultType<Option<&'a str>> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        camellia_remote_protocol::bail!("Proxy request contains duplicate {name} headers");
+    }
+    value
+        .to_str()
+        .with_context(|| format!("Proxy request contains non-text {name}"))
+        .map(Some)
+}
 
 pub fn parse_bind_address(value: &str) -> Result<Option<IpAddr>> {
     let value = value.trim();
@@ -630,6 +803,116 @@ mod tests {
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
         );
         assert!(parse_bind_address("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_configuration_fails_closed() {
+        assert!(TrustedProxyConfig::parse(true, "").is_err());
+        assert!(TrustedProxyConfig::parse(false, "127.0.0.1/32").is_err());
+        assert!(TrustedProxyConfig::parse(true, "0.0.0.0/0").is_err());
+        assert!(TrustedProxyConfig::parse(true, "::/0").is_err());
+        assert!(TrustedProxyConfig::parse(true, "not-a-network").is_err());
+        assert!(TrustedProxyConfig::parse(true, "127.0.0.1/32,").is_err());
+        assert!(TrustedProxyConfig::parse(true, "127.0.0.1/32,127.0.0.1/32").is_err());
+        assert!(TrustedProxyConfig::parse(true, "10.0.0.1/8,10.2.3.4/8").is_err());
+
+        let config =
+            TrustedProxyConfig::parse(true, "127.0.0.1/32, 10.0.0.0/8, 2001:db8:1::/48").unwrap();
+        assert!(config.is_enabled());
+        assert_eq!(config.network_count(), 3);
+    }
+
+    #[test]
+    fn trusted_proxy_ignores_spoofed_headers_from_an_untrusted_tcp_peer() {
+        let config = TrustedProxyConfig::parse(true, "10.0.0.0/8").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+        headers.insert("x-forwarded-for", "invalid, 198.51.100.7".parse().unwrap());
+
+        assert_eq!(
+            config
+                .resolve_client_ip("192.0.2.44".parse().unwrap(), &headers)
+                .unwrap(),
+            "192.0.2.44".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_selects_the_rightmost_untrusted_forwarded_hop() {
+        let config = TrustedProxyConfig::parse(true, "10.0.0.0/8,2001:db8:1::/48").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.99, 203.0.113.8, 10.1.2.3".parse().unwrap(),
+        );
+
+        assert_eq!(
+            config
+                .resolve_client_ip("10.9.8.7".parse().unwrap(), &headers)
+                .unwrap(),
+            "203.0.113.8".parse::<IpAddr>().unwrap()
+        );
+
+        headers.insert(
+            "x-forwarded-for",
+            "2001:db8:ffff::5, 2001:db8:1::20".parse().unwrap(),
+        );
+        assert_eq!(
+            config
+                .resolve_client_ip("2001:db8:1::10".parse().unwrap(), &headers)
+                .unwrap(),
+            "2001:db8:ffff::5".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_consistent_single_address_headers() {
+        let config = TrustedProxyConfig::parse(true, "127.0.0.0/8").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "198.51.100.10".parse().unwrap());
+        headers.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
+
+        assert_eq!(
+            config
+                .resolve_client_ip("::ffff:127.0.0.1".parse().unwrap(), &headers)
+                .unwrap(),
+            "198.51.100.10".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_ambiguous_or_malformed_headers() {
+        let config = TrustedProxyConfig::parse(true, "10.0.0.0/8").unwrap();
+        let peer = "10.0.0.1".parse().unwrap();
+
+        let mut mismatched = HeaderMap::new();
+        mismatched.insert("x-real-ip", "198.51.100.1".parse().unwrap());
+        mismatched.insert("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        assert!(config.resolve_client_ip(peer, &mismatched).is_err());
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert("x-forwarded-for", "198.51.100.1,,10.0.0.2".parse().unwrap());
+        assert!(config.resolve_client_ip(peer, &malformed).is_err());
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append("x-real-ip", "198.51.100.1".parse().unwrap());
+        duplicate.append("x-real-ip", "198.51.100.2".parse().unwrap());
+        assert!(config.resolve_client_ip(peer, &duplicate).is_err());
+
+        let mut all_trusted = HeaderMap::new();
+        all_trusted.insert("x-forwarded-for", "10.0.0.2, 10.0.0.3".parse().unwrap());
+        assert!(config.resolve_client_ip(peer, &all_trusted).is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_without_address_headers_uses_the_tcp_peer() {
+        let config = TrustedProxyConfig::parse(true, "10.0.0.0/8").unwrap();
+        assert_eq!(
+            config
+                .resolve_client_ip("10.0.0.7".parse().unwrap(), &HeaderMap::new())
+                .unwrap(),
+            "10.0.0.7".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]

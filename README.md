@@ -39,11 +39,15 @@ Important settings:
 - `CAMELLIA_REMOTE_RELAY_PORT`: relay base port, default 21117.
 - `CAMELLIA_REMOTE_RELAY_SERVERS`: public relay `host:port` values advertised to clients.
 - `CAMELLIA_REMOTE_API_SERVER`: bare management API origin. Non-loopback HTTP is rejected.
-- `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE`: shared high-entropy verification secret.
-- `CAMELLIA_REMOTE_TRUST_PROXY_HEADERS`: keep `N` unless a trusted proxy overwrites client
-  address headers.
+- `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE`: shared high-entropy verification secret used both to authenticate deployment checks and to verify their HMAC-SHA256 assertions.
+- `CAMELLIA_REMOTE_TRUST_PROXY_HEADERS`: keep `N` unless WebSocket ingress uses the strict
+  trusted-proxy contract.
+- `CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS`: required comma-separated IPv4/IPv6 CIDRs when proxy
+  headers are enabled; direct peers outside these networks cannot override their TCP address.
 - `CAMELLIA_REMOTE_DB_URL`: identity SQLite path. The clean default is
   `./camellia-remote.sqlite3`.
+
+Managed registration uses the breaking `camellia-deployment-assertion-v1` contract. Identity sends a fresh random 32-byte nonce with every deployment check and accepts only a version-1 JSON assertion bound to that nonce, the rid, UUID, public-key hash, deployment generation, and an expiry no more than 60 seconds in the future. Static 204 responses are rejected. The generation is stored with peer metadata; the same or an older generation cannot replace a persisted UUID/public key, while a strictly newer Management-approved generation can. A successful verification leases the online registration for at most 15 seconds. An explicit Management 404 immediately expires the in-memory peer and any pending rendezvous tokens without erasing its persisted identity; a Management outage stops refreshing `last_reg_time`, so discovery fails closed within the existing 30-second online timeout. Upgrade Management and Server together and preserve the SQLite identity state across restarts.
 
 See [the complete environment reference](docs/environment-variables.md).
 
@@ -74,6 +78,11 @@ sudo systemctl enable --now camellia-remote-identity.service
 
 TLS should terminate at a hardened reverse proxy where WebSocket ingress is
 needed. Expose only the required ports and retain host/firewall rate controls.
+When proxy address headers are enabled, list only the final proxy hops in
+`CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS`. `X-Forwarded-For` is evaluated from right
+to left through trusted hops; if both supported headers are present they must
+identify the same client. Invalid headers from a trusted proxy reject the
+WebSocket upgrade, while headers from direct untrusted peers are ignored.
 Never put the private server key or device-verification token in an image,
 repository, log, or command history.
 

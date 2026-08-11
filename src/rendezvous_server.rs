@@ -8,9 +8,11 @@ use camellia_remote_protocol::{
     bytes_codec::RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH,
     config,
     crypto::{box_, secretbox, sign},
+    error,
     futures::future::join_all,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
+    message_proto::ErrorCode,
     protobuf::{Message as _, MessageField},
     rand::{rngs::OsRng, RngCore},
     rendezvous_proto::{
@@ -32,10 +34,11 @@ use camellia_remote_protocol::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
+use serde_derive::Deserialize;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
     time::Instant,
 };
@@ -66,8 +69,20 @@ const RENDEZVOUS_TOKEN_LEN: usize = 32;
 const RELAY_SERVER_NAME_MAX_LEN: usize = 512;
 const PEER_CACHE_CLEANUP_INTERVAL_SECS: u64 = 300;
 const PEER_CACHE_IDLE_SECS: u64 = 600;
-const DEPLOYMENT_VERIFICATION_CACHE_SECS: u64 = 30;
+const DEPLOYMENT_VERIFICATION_CACHE_SECS: u64 = 15;
+const _: () = assert!(DEPLOYMENT_VERIFICATION_CACHE_SECS <= 15);
+const DEPLOYMENT_ASSERTION_VERSION: &str = "camellia-deployment-assertion-v1";
+const DEPLOYMENT_ASSERTION_MAX_FUTURE_SECS: i64 = 60;
 const HC_KEEP_ALIVE_SECS: i32 = 10;
+
+fn http_proxy_error(status: i32, code: ErrorCode) -> HttpProxyResponse {
+    let mut response = HttpProxyResponse {
+        status,
+        ..Default::default()
+    };
+    response.typed_error = MessageField::some(error::for_code(code));
+    response
+}
 
 fn sha256_hex(data: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -78,6 +93,88 @@ fn sha256_hex(data: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let mut normalized = [0_u8; BLOCK_BYTES];
+    if key.len() > BLOCK_BYTES {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; BLOCK_BYTES];
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+#[derive(Deserialize)]
+struct DeploymentAssertion {
+    version: u8,
+    deployment_generation: u64,
+    request_nonce: String,
+    expires_at: i64,
+    assertion: String,
+}
+
+fn validate_deployment_assertion(
+    assertion: &DeploymentAssertion,
+    id: &str,
+    uuid: &[u8],
+    public_key_hash: &str,
+    request_nonce: &str,
+    secret: &str,
+    now: i64,
+) -> ResultType<u64> {
+    if assertion.version != 1
+        || !constant_time_eq(assertion.request_nonce.as_bytes(), request_nonce.as_bytes())
+    {
+        bail!("API returned an invalid deployment assertion");
+    }
+    if assertion.expires_at < now
+        || assertion.expires_at > now + DEPLOYMENT_ASSERTION_MAX_FUTURE_SECS
+    {
+        bail!("API returned an expired deployment assertion");
+    }
+    let message = [
+        DEPLOYMENT_ASSERTION_VERSION,
+        id,
+        &BASE64.encode(uuid),
+        public_key_hash,
+        &assertion.deployment_generation.to_string(),
+        request_nonce,
+        &assertion.expires_at.to_string(),
+    ]
+    .join("\n");
+    let supplied = BASE64
+        .decode(assertion.assertion.as_bytes())
+        .context("API returned malformed deployment assertion encoding")?;
+    let expected = hmac_sha256(secret.as_bytes(), message.as_bytes());
+    if !constant_time_eq(&supplied, &expected) {
+        bail!("API returned an invalid deployment assertion signature");
+    }
+    Ok(assertion.deployment_generation)
 }
 
 #[derive(Clone, Debug)]
@@ -110,17 +207,58 @@ struct PunchReqEntry {
     to_id: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingRendezvousKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendezvousResponseKind {
     Direct,
     Local,
     Relay,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingRendezvousResults {
+    DirectOrRelay,
+    LocalOrRelay,
+    RelayOnly,
+}
+
+impl PendingRendezvousResults {
+    fn allows(self, response: RendezvousResponseKind) -> bool {
+        matches!(
+            (self, response),
+            (
+                Self::DirectOrRelay,
+                RendezvousResponseKind::Direct | RendezvousResponseKind::Relay
+            ) | (
+                Self::LocalOrRelay,
+                RendezvousResponseKind::Local | RendezvousResponseKind::Relay
+            ) | (Self::RelayOnly, RendezvousResponseKind::Relay)
+        )
+    }
+}
+
+fn pending_results_for_punch(
+    force_relay: bool,
+    server_forces_relay: bool,
+    requester_is_symmetric: bool,
+    same_network: bool,
+) -> PendingRendezvousResults {
+    if force_relay || server_forces_relay {
+        PendingRendezvousResults::RelayOnly
+    } else if same_network {
+        // A requester's public NAT classification does not prevent a local-address
+        // connection. The responder can still fall back to relay if local setup fails.
+        PendingRendezvousResults::LocalOrRelay
+    } else if requester_is_symmetric {
+        PendingRendezvousResults::RelayOnly
+    } else {
+        PendingRendezvousResults::DirectOrRelay
+    }
+}
+
 struct PendingRendezvous {
     requester: SocketAddr,
     responder_id: String,
-    kind: PendingRendezvousKind,
+    allowed_results: PendingRendezvousResults,
     relay_server: String,
     created_at: Instant,
 }
@@ -136,7 +274,7 @@ fn consume_pending_rendezvous_in(
     token: &Bytes,
     responder_id: &str,
     claimed_requester: SocketAddr,
-    expected_kind: Option<PendingRendezvousKind>,
+    response_kind: RendezvousResponseKind,
     now: Instant,
 ) -> ResultType<ConsumedRendezvous> {
     if token.len() != RENDEZVOUS_TOKEN_LEN {
@@ -152,7 +290,7 @@ fn consume_pending_rendezvous_in(
         bail!("Expired rendezvous token");
     }
     if entry.responder_id != responder_id
-        || expected_kind.is_some_and(|kind| entry.kind != kind)
+        || !entry.allowed_results.allows(response_kind)
         || entry.requester != try_into_v4(claimed_requester)
     {
         bail!("Rendezvous response does not match its request");
@@ -164,6 +302,16 @@ fn consume_pending_rendezvous_in(
     pending.remove(token);
     Ok(consumed)
 }
+
+fn revoke_pending_rendezvous_in(
+    pending: &mut HashMap<Bytes, PendingRendezvous>,
+    responder_id: &str,
+) -> usize {
+    let before = pending.len();
+    pending.retain(|_, entry| entry.responder_id != responder_id);
+    before - pending.len()
+}
+
 static PUNCH_REQS: Lazy<TokioMutex<VecDeque<PunchReqEntry>>> =
     Lazy::new(|| TokioMutex::new(VecDeque::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
@@ -173,7 +321,7 @@ const HANDSHAKE_WAIT_MS: u64 = 8_000;
 struct Inner {
     serial: i32,
     api_server: String,
-    trust_proxy_headers: bool,
+    trusted_proxies: TrustedProxyConfig,
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: sign::SecretKey,
@@ -226,6 +374,7 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     connection_slots: Arc<Semaphore>,
+    deployment_verification_sequence: Arc<AtomicU64>,
 }
 
 enum LoopFailure {
@@ -244,6 +393,16 @@ struct RendezvousListeners {
 }
 
 impl RendezvousServer {
+    fn next_deployment_verification_sequence(&self) -> u64 {
+        match self.deployment_verification_sequence.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |sequence| sequence.checked_add(1),
+        ) {
+            Ok(sequence) | Err(sequence) => sequence,
+        }
+    }
+
     fn valid_peer_id(id: &str) -> bool {
         (PEER_ID_MIN_LEN..=PEER_ID_MAX_LEN).contains(&id.len())
             && id
@@ -298,7 +457,7 @@ impl RendezvousServer {
         uuid: &Bytes,
         pk: &Bytes,
         ip: &str,
-        managed_authorized: bool,
+        managed_generation: Option<u64>,
     ) -> ResultType<PeerRegistrationStage> {
         if peer.persistence_in_progress {
             return Ok(PeerRegistrationStage::Busy);
@@ -306,10 +465,13 @@ impl RendezvousServer {
         if peer.uuid.is_empty() {
             // First registration claims the in-memory peer before database
             // I/O, closing the concurrent first-writer takeover window.
-        } else if managed_authorized {
-            // The management API is authoritative for a managed deployment.
-            // This permits an administrator-approved machine/key replacement
-            // without retaining the stale hbbs-local UUID forever.
+        } else if let Some(generation) = managed_generation {
+            let same_identity = peer.uuid == *uuid && peer.pk == *pk;
+            if generation < peer.info.deployment_generation
+                || (!same_identity && generation <= peer.info.deployment_generation)
+            {
+                return Ok(PeerRegistrationStage::UuidMismatch);
+            }
         } else if peer.uuid == *uuid {
             if peer.info.ip != ip && peer.pk != *pk {
                 log::warn!(
@@ -336,13 +498,22 @@ impl RendezvousServer {
         peer.reg_pk.1 = Instant::now();
 
         let ip_changed = !peer.uuid.is_empty() && peer.info.ip != ip;
-        let changed = peer.uuid.is_empty() || peer.uuid != *uuid || peer.pk != *pk || ip_changed;
+        let generation_changed = managed_generation
+            .is_some_and(|generation| generation != peer.info.deployment_generation);
+        let changed = peer.uuid.is_empty()
+            || peer.uuid != *uuid
+            || peer.pk != *pk
+            || ip_changed
+            || generation_changed;
         if !changed {
             return Ok(PeerRegistrationStage::Unchanged);
         }
 
         let mut updated_info = peer.info.clone();
         updated_info.ip = ip.to_owned();
+        if let Some(generation) = managed_generation {
+            updated_info.deployment_generation = generation;
+        }
         let serialized_info = serde_json::to_string(&updated_info)?;
         let rollback = PeerRegistrationRollback {
             socket_addr: peer.socket_addr,
@@ -433,7 +604,15 @@ impl RendezvousServer {
             .build()?;
         log::info!("api_server: {}", api_server);
         let trust_proxy_headers = crate::common::get_yes_no_arg("trust-proxy-headers", false)?;
-        log::info!("trust_proxy_headers: {}", trust_proxy_headers);
+        let trusted_proxies = TrustedProxyConfig::parse(
+            trust_proxy_headers,
+            &crate::common::get_arg("trusted-proxy-cidrs"),
+        )?;
+        log::info!(
+            "trusted_proxy_headers: {}, trusted_proxy_cidrs: {}",
+            trusted_proxies.is_enabled(),
+            trusted_proxies.network_count()
+        );
         let runtime_console = crate::common::get_yes_no_arg("ENABLE_RUNTIME_CONSOLE", false)?;
         if runtime_console {
             log::warn!("Unauthenticated loopback runtime console is enabled");
@@ -465,10 +644,11 @@ impl RendezvousServer {
             relay_servers0: Default::default(),
             rendezvous_servers: Arc::new(rendezvous_servers),
             connection_slots: Arc::new(Semaphore::new(max_connections)),
+            deployment_verification_sequence: Arc::new(AtomicU64::new(1)),
             inner: Arc::new(Inner {
                 serial,
                 api_server,
-                trust_proxy_headers,
+                trusted_proxies,
                 sk,
                 mask,
                 local_ip,
@@ -798,7 +978,7 @@ impl RendezvousServer {
                     .reserve_pending_rendezvous(
                         addr,
                         rf.id.clone(),
-                        PendingRendezvousKind::Relay,
+                        PendingRendezvousResults::RelayOnly,
                         relay_server.clone(),
                     )
                     .await
@@ -845,7 +1025,7 @@ impl RendezvousServer {
                         &rr.rendezvous_token,
                         &id,
                         &rr.socket_addr,
-                        Some(PendingRendezvousKind::Relay),
+                        RendezvousResponseKind::Relay,
                     )
                     .await
                 {
@@ -904,35 +1084,19 @@ impl RendezvousServer {
             Some(rendezvous_message::Union::HttpProxyRequest(req)) => {
                 let resp = if !Self::http_proxy_authorized(true, key, &req.licence_key) {
                     log::warn!("Rejected unauthorized API proxy request from {}", addr);
-                    HttpProxyResponse {
-                        status: 403,
-                        error: "API proxy authorization failed".to_owned(),
-                        ..Default::default()
-                    }
+                    http_proxy_error(403, ErrorCode::PERMISSION_DENIED)
                 } else if !self.allow_http_proxy_request(addr.ip()).await {
-                    HttpProxyResponse {
-                        status: 429,
-                        error: "API proxy rate limit exceeded".to_owned(),
-                        ..Default::default()
-                    }
+                    http_proxy_error(429, ErrorCode::RATE_LIMITED)
                 } else {
                     match self.inner.http_proxy_slots.clone().try_acquire_owned() {
                         Ok(_permit) => match self.handle_http_proxy_request(req, addr.ip()).await {
                             Ok(resp) => resp,
                             Err(err) => {
                                 log::warn!("API proxy request from {} failed: {}", addr, err);
-                                HttpProxyResponse {
-                                    status: 502,
-                                    error: "API upstream request failed".to_owned(),
-                                    ..Default::default()
-                                }
+                                http_proxy_error(502, ErrorCode::HTTP_PROXY_FAILED)
                             }
                         },
-                        Err(_) => HttpProxyResponse {
-                            status: 503,
-                            error: "API proxy is busy".to_owned(),
-                            ..Default::default()
-                        },
+                        Err(_) => http_proxy_error(503, ErrorCode::SERVICE_BUSY),
                     }
                 };
                 let mut msg_out = RendezvousMessage::new();
@@ -1046,24 +1210,40 @@ impl RendezvousServer {
         if !allow_ip_request(&ip, &id).await {
             return Ok(Some(TOO_FREQUENT));
         }
-        let managed_authorized = if self.inner.allow_unmanaged_devices {
-            false
+        let managed_verification = if self.inner.allow_unmanaged_devices {
+            None
         } else {
+            let sequence = self.next_deployment_verification_sequence();
             match self.verify_device_deployment(&id, &uuid, &pk).await {
-                Ok(true) => true,
-                Ok(false) => return Ok(Some(register_pk_response::Result::NOT_DEPLOYED)),
+                Ok(Some(generation)) => Some((generation, sequence)),
+                Ok(None) => {
+                    // Allocate a barrier when the authoritative revocation is
+                    // observed, not only when this request started. This makes
+                    // every verification already in flight stale; only a new
+                    // request initiated after the 404 may bring the peer back.
+                    let revocation_sequence = self.next_deployment_verification_sequence();
+                    self.revoke_managed_registration(&id, revocation_sequence)
+                        .await;
+                    return Ok(Some(register_pk_response::Result::NOT_DEPLOYED));
+                }
                 Err(err) => {
                     log::warn!("Device deployment verification failed for {}: {}", id, err);
                     return Ok(Some(register_pk_response::Result::SERVER_ERROR));
                 }
             }
         };
+        let managed_generation = managed_verification.map(|(generation, _)| generation);
 
         let Some(peer) = self.pm.get_or(&id).await? else {
             return Ok(Some(register_pk_response::Result::SERVER_ERROR));
         };
         let stage = {
             let mut peer = peer.write().await;
+            if let Some((_, sequence)) = managed_verification {
+                if !peer.apply_managed_verification(sequence) {
+                    return Ok(Some(register_pk_response::Result::SERVER_ERROR));
+                }
+            }
             Self::stage_peer_registration(
                 &mut peer,
                 &id,
@@ -1071,7 +1251,7 @@ impl RendezvousServer {
                 &uuid,
                 &pk,
                 &ip,
-                managed_authorized,
+                managed_generation,
             )?
         };
         let pending = match stage {
@@ -1081,8 +1261,12 @@ impl RendezvousServer {
             PeerRegistrationStage::UuidMismatch => return Ok(Some(UUID_MISMATCH)),
             PeerRegistrationStage::TooFrequent => return Ok(Some(TOO_FREQUENT)),
             PeerRegistrationStage::Unchanged => {
-                if managed_authorized {
-                    peer.write().await.deployment_verified_at = Some(Instant::now());
+                if let Some((_, sequence)) = managed_verification {
+                    let mut peer = peer.write().await;
+                    if peer.deployment_verification_sequence != sequence {
+                        return Ok(Some(register_pk_response::Result::SERVER_ERROR));
+                    }
+                    peer.deployment_verified_at = Some(Instant::now());
                 }
                 return Ok(Some(register_pk_response::Result::OK));
             }
@@ -1098,6 +1282,7 @@ impl RendezvousServer {
         let database = self.pm.db.clone();
         let persisted_peer = peer.clone();
         let persisted_id = id.clone();
+        let verification_sequence = managed_verification.map(|(_, sequence)| sequence);
         let persistence = tokio::spawn(async move {
             let result = if guid.is_empty() {
                 database.insert_peer(&persisted_id, &uuid, &pk, &info).await
@@ -1113,25 +1298,47 @@ impl RendezvousServer {
                 Ok(guid) => {
                     peer.guid = guid;
                     peer.persistence_in_progress = false;
-                    if managed_authorized {
-                        peer.deployment_verified_at = Some(Instant::now());
-                    }
-                    Ok(())
+                    let verification_is_current = if let Some(sequence) = verification_sequence {
+                        if peer.deployment_verification_sequence != sequence {
+                            peer.socket_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+                            peer.last_reg_time = get_expired_time();
+                            peer.deployment_verified_at = None;
+                            false
+                        } else {
+                            peer.deployment_verified_at = Some(Instant::now());
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    Ok(verification_is_current)
                 }
                 Err(err) => {
-                    peer.socket_addr = rollback.socket_addr;
-                    peer.last_reg_time = rollback.last_reg_time;
                     peer.uuid = rollback.uuid;
                     peer.pk = rollback.pk;
                     peer.info = rollback.info;
-                    peer.deployment_verified_at = rollback.deployment_verified_at;
+                    if verification_sequence
+                        .is_some_and(|sequence| peer.deployment_verification_sequence != sequence)
+                    {
+                        peer.socket_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+                        peer.last_reg_time = get_expired_time();
+                        peer.deployment_verified_at = None;
+                    } else {
+                        peer.socket_addr = rollback.socket_addr;
+                        peer.last_reg_time = rollback.last_reg_time;
+                        peer.deployment_verified_at = rollback.deployment_verified_at;
+                    }
                     peer.persistence_in_progress = false;
                     Err(err)
                 }
             }
         });
         match persistence.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                log::warn!("Discarded stale deployment verification result for {}", id);
+                return Ok(Some(register_pk_response::Result::SERVER_ERROR));
+            }
             Ok(Err(err)) => {
                 log::error!("Failed to persist peer {}: {}", id, err);
                 return Ok(Some(register_pk_response::Result::SERVER_ERROR));
@@ -1147,6 +1354,17 @@ impl RendezvousServer {
         }
 
         Ok(Some(register_pk_response::Result::OK))
+    }
+
+    async fn revoke_managed_registration(&self, id: &str, sequence: u64) {
+        if let Some(peer) = self.pm.get_in_memory(id).await {
+            peer.write().await.revoke_managed_registration(sequence);
+        }
+        // Pending rendezvous authorization is independent of peer-cache
+        // residency. An evicted responder must not retain a usable token after
+        // Management has returned an authoritative 404.
+        let mut pending = self.pending_rendezvous.lock().await;
+        revoke_pending_rendezvous_in(&mut pending, id);
     }
 
     #[inline]
@@ -1169,7 +1387,7 @@ impl RendezvousServer {
                 &phs.rendezvous_token,
                 &phs.id,
                 &phs.socket_addr,
-                Some(PendingRendezvousKind::Direct),
+                RendezvousResponseKind::Direct,
             )
             .await?;
         let addr_a = pending.requester;
@@ -1212,7 +1430,7 @@ impl RendezvousServer {
                 &la.rendezvous_token,
                 &la.id,
                 &la.socket_addr,
-                Some(PendingRendezvousKind::Local),
+                RendezvousResponseKind::Local,
             )
             .await?;
         let addr_a = pending.requester;
@@ -1235,7 +1453,7 @@ impl RendezvousServer {
         &self,
         requester: SocketAddr,
         responder_id: String,
-        kind: PendingRendezvousKind,
+        allowed_results: PendingRendezvousResults,
         relay_server: String,
     ) -> ResultType<Bytes> {
         let mut pending = self.pending_rendezvous.lock().await;
@@ -1255,7 +1473,7 @@ impl RendezvousServer {
                     PendingRendezvous {
                         requester: try_into_v4(requester),
                         responder_id,
-                        kind,
+                        allowed_results,
                         relay_server,
                         created_at: Instant::now(),
                     },
@@ -1270,7 +1488,7 @@ impl RendezvousServer {
         token: &Bytes,
         responder_id: &str,
         claimed_requester: &[u8],
-        expected_kind: Option<PendingRendezvousKind>,
+        response_kind: RendezvousResponseKind,
     ) -> ResultType<ConsumedRendezvous> {
         let claimed_requester = AddrMangle::try_decode(claimed_requester)
             .filter(|addr| addr.port() != 0)
@@ -1282,7 +1500,7 @@ impl RendezvousServer {
             token,
             responder_id,
             claimed_requester,
-            expected_kind,
+            response_kind,
             Instant::now(),
         )
     }
@@ -1376,34 +1594,33 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
-                if peer_is_lan {
-                    // https://github.com/rustdesk/rustdesk-server/issues/24
-                    relay_server = self.inner.local_ip.clone()
-                }
+            let always_use_relay = ALWAYS_USE_RELAY.load(Ordering::SeqCst);
+            let crosses_lan_boundary = peer_is_lan ^ is_lan;
+            let server_forces_relay = always_use_relay || crosses_lan_boundary || ws;
+            if (always_use_relay || crosses_lan_boundary) && peer_is_lan {
+                // https://github.com/rustdesk/rustdesk-server/issues/24
+                relay_server = self.inner.local_ip.clone()
+            }
+            if server_forces_relay {
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
-            let same_intranet: bool = !ph.force_relay
-                && !ws
-                && (peer_is_lan && is_lan || {
-                    match (peer_addr, addr) {
-                        (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
-                        (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
-                        _ => false,
-                    }
-                });
+            let same_network = peer_is_lan && is_lan || {
+                match (peer_addr, addr) {
+                    (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
+                    (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
+                    _ => false,
+                }
+            };
+            let allowed_results = pending_results_for_punch(
+                ph.force_relay,
+                server_forces_relay,
+                ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC),
+                same_network,
+            );
+            let same_intranet = allowed_results == PendingRendezvousResults::LocalOrRelay;
             let socket_addr = AddrMangle::encode(addr).into();
             let rendezvous_token = self
-                .reserve_pending_rendezvous(
-                    addr,
-                    id.clone(),
-                    if same_intranet {
-                        PendingRendezvousKind::Local
-                    } else {
-                        PendingRendezvousKind::Direct
-                    },
-                    relay_server.clone(),
-                )
+                .reserve_pending_rendezvous(addr, id.clone(), allowed_results, relay_server.clone())
                 .await?;
             if same_intranet {
                 log::debug!(
@@ -1526,15 +1743,18 @@ impl RendezvousServer {
         id: &str,
         uuid: &[u8],
         public_key: &[u8],
-    ) -> ResultType<bool> {
+    ) -> ResultType<Option<u64>> {
         if self.inner.allow_unmanaged_devices {
-            return Ok(true);
+            return Ok(Some(0));
         }
         let base = self.inner.api_server.trim_end_matches('/');
         if base.is_empty() {
             bail!("API server is not configured");
         }
         let public_key_hash = sha256_hex(public_key);
+        let mut nonce = [0_u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        let request_nonce = BASE64.encode(nonce);
         let response = self
             .inner
             .http_client
@@ -1544,13 +1764,27 @@ impl RendezvousServer {
                 "id": id,
                 "uuid": BASE64.encode(uuid),
                 "public_key_hash": public_key_hash,
+                "request_nonce": request_nonce,
             }))
             .send()
             .await?;
         match response.status().as_u16() {
-            204 => Ok(true),
+            200 => {
+                let assertion: DeploymentAssertion = response.json().await?;
+                let now = chrono::Utc::now().timestamp();
+                let generation = validate_deployment_assertion(
+                    &assertion,
+                    id,
+                    uuid,
+                    &public_key_hash,
+                    &request_nonce,
+                    &self.inner.device_verification_token,
+                    now,
+                )?;
+                Ok(Some(generation))
+            }
             401 | 403 => bail!("API rejected the rendezvous server credential"),
-            400 | 404 => Ok(false),
+            400 | 404 => Ok(None),
             status => bail!("API returned status {status}"),
         }
     }
@@ -2275,33 +2509,32 @@ impl RendezvousServer {
         let mut sink;
         let mut health_keepalive_started = false;
         if ws {
-            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-            let trust_proxy_headers = self.inner.trust_proxy_headers;
+            use tokio_tungstenite::tungstenite::{
+                handshake::server::{ErrorResponse, Request, Response},
+                http::StatusCode,
+            };
+            let trusted_proxies = &self.inner.trusted_proxies;
             let callback = |req: &Request, response: Response| {
-                if trust_proxy_headers {
-                    // Only consulted when the operator opts in with --trust-proxy-headers.
-                    // These headers are NOT verifiable: anyone able to reach this port
-                    // directly can spoof an arbitrary IP, bypassing IP-based rate limiting
-                    // and corrupting logged addresses. Enable it only when the WebSocket
-                    // port is reachable exclusively through a reverse proxy that overwrites
-                    // them. https://github.com/rustdesk/rustdesk-server/issues/634
-                    let headers = req.headers();
-                    let real_ip = headers
-                        .get("X-Real-IP")
-                        .or_else(|| headers.get("X-Forwarded-For"))
-                        .and_then(|header_value| header_value.to_str().ok())
-                        .and_then(|value| value.split(',').next())
-                        .map(|value| value.trim())
-                        .filter(|value| !value.is_empty());
-                    if let Some(ip) = real_ip {
-                        if let Ok(real_ip_addr) = ip.parse::<IpAddr>() {
-                            // Keep the accepted TCP source port to avoid key collisions for
-                            // concurrent websocket clients from the same public IP.
-                            addr = SocketAddr::new(real_ip_addr, addr.port());
-                        }
+                match trusted_proxies.resolve_client_ip(addr.ip(), req.headers()) {
+                    Ok(client_ip) => {
+                        // Keep the accepted TCP source port to avoid key collisions for
+                        // concurrent WebSocket clients from the same public IP.
+                        addr.set_ip(client_ip);
+                        Ok(response)
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "Rejected rendezvous WebSocket proxy headers from {}: {}",
+                            addr.ip(),
+                            err
+                        );
+                        let mut error = ErrorResponse::new(Some(
+                            "Invalid proxy client address headers".to_owned(),
+                        ));
+                        *error.status_mut() = StatusCode::BAD_REQUEST;
+                        Err(error)
                     }
                 }
-                Ok(response)
             };
             let websocket_config = tungstenite::protocol::WebSocketConfig::default()
                 .read_buffer_size(16 * 1024)
@@ -2610,6 +2843,124 @@ mod tests {
     }
 
     #[test]
+    fn revoked_managed_registration_is_offline_without_erasing_identity() {
+        let mut peer = Peer::default();
+        peer.socket_addr = SocketAddr::from(([192, 0, 2, 20], 21116));
+        peer.last_reg_time = Instant::now();
+        peer.uuid = Bytes::from_static(b"managed-device");
+        peer.pk = Bytes::from(vec![4; PEER_PUBLIC_KEY_LEN]);
+        peer.deployment_verified_at = Some(Instant::now());
+
+        assert!(peer.apply_managed_verification(2));
+        peer.revoke_managed_registration(3);
+
+        assert_eq!(peer.socket_addr.port(), 0);
+        assert!(peer.last_reg_time.elapsed().as_millis() >= REG_TIMEOUT as u128);
+        assert!(peer.deployment_verified_at.is_none());
+        assert_eq!(peer.uuid, Bytes::from_static(b"managed-device"));
+        assert_eq!(peer.pk, Bytes::from(vec![4; PEER_PUBLIC_KEY_LEN]));
+        assert_eq!(peer.deployment_verification_sequence, 3);
+        assert!(!peer.apply_managed_verification(2));
+        assert!(peer.apply_managed_verification(4));
+    }
+
+    #[test]
+    fn explicit_revocation_clears_only_matching_pending_rendezvous() {
+        let now = Instant::now();
+        let requester = SocketAddr::from(([192, 0, 2, 30], 21116));
+        let mut pending = HashMap::from([
+            (
+                Bytes::from(vec![1; RENDEZVOUS_TOKEN_LEN]),
+                PendingRendezvous {
+                    requester,
+                    responder_id: "revoked-device".to_owned(),
+                    allowed_results: PendingRendezvousResults::DirectOrRelay,
+                    relay_server: "relay.example.test".to_owned(),
+                    created_at: now,
+                },
+            ),
+            (
+                Bytes::from(vec![2; RENDEZVOUS_TOKEN_LEN]),
+                PendingRendezvous {
+                    requester,
+                    responder_id: "active-device".to_owned(),
+                    allowed_results: PendingRendezvousResults::RelayOnly,
+                    relay_server: "relay.example.test".to_owned(),
+                    created_at: now,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            revoke_pending_rendezvous_in(&mut pending, "revoked-device"),
+            1
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending
+                .values()
+                .next()
+                .map(|entry| entry.responder_id.as_str()),
+            Some("active-device")
+        );
+    }
+
+    #[test]
+    fn deployment_assertion_is_nonce_bound_signed_and_short_lived() {
+        let id = "device01";
+        let uuid = b"device-uuid";
+        let key_hash = sha256_hex(b"device-key");
+        let nonce = BASE64.encode([7_u8; 32]);
+        let secret = "management-verification-secret-with-32-bytes";
+        let now = 1_800_000_000_i64;
+        let expires_at = now + 30;
+        let generation = 7_u64;
+        let message = [
+            DEPLOYMENT_ASSERTION_VERSION,
+            id,
+            &BASE64.encode(uuid),
+            &key_hash,
+            &generation.to_string(),
+            &nonce,
+            &expires_at.to_string(),
+        ]
+        .join("\n");
+        let assertion = DeploymentAssertion {
+            version: 1,
+            deployment_generation: generation,
+            request_nonce: nonce.clone(),
+            expires_at,
+            assertion: BASE64.encode(hmac_sha256(secret.as_bytes(), message.as_bytes())),
+        };
+
+        assert_eq!(
+            validate_deployment_assertion(&assertion, id, uuid, &key_hash, &nonce, secret, now)
+                .unwrap(),
+            generation
+        );
+        assert!(validate_deployment_assertion(
+            &assertion,
+            id,
+            uuid,
+            &key_hash,
+            &BASE64.encode([8_u8; 32]),
+            secret,
+            now,
+        )
+        .is_err());
+        assert!(validate_deployment_assertion(
+            &assertion,
+            id,
+            uuid,
+            &key_hash,
+            &nonce,
+            secret,
+            expires_at + 1,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn peer_ids_are_bounded_and_canonical() {
         for id in ["123456", "device_01", "Device-01", "abcdefghijklmnop"] {
             assert!(RendezvousServer::valid_peer_id(id), "{id}");
@@ -2627,6 +2978,160 @@ mod tests {
     }
 
     #[test]
+    fn punch_requests_reserve_the_minimal_allowed_results() {
+        for (force_relay, server_forces_relay, symmetric, same_network, expected) in [
+            (
+                false,
+                false,
+                false,
+                false,
+                PendingRendezvousResults::DirectOrRelay,
+            ),
+            (
+                false,
+                false,
+                false,
+                true,
+                PendingRendezvousResults::LocalOrRelay,
+            ),
+            (
+                true,
+                false,
+                false,
+                false,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                false,
+                true,
+                false,
+                false,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                false,
+                true,
+                false,
+                true,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                false,
+                false,
+                true,
+                false,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                false,
+                false,
+                true,
+                true,
+                PendingRendezvousResults::LocalOrRelay,
+            ),
+        ] {
+            assert_eq!(
+                pending_results_for_punch(
+                    force_relay,
+                    server_forces_relay,
+                    symmetric,
+                    same_network,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pending_rendezvous_result_matrix_is_minimal() {
+        let now = Instant::now();
+        let requester = SocketAddr::from(([192, 0, 2, 10], 45_000));
+        let cases = [
+            (
+                PendingRendezvousResults::DirectOrRelay,
+                RendezvousResponseKind::Direct,
+                true,
+            ),
+            (
+                PendingRendezvousResults::DirectOrRelay,
+                RendezvousResponseKind::Local,
+                false,
+            ),
+            (
+                PendingRendezvousResults::DirectOrRelay,
+                RendezvousResponseKind::Relay,
+                true,
+            ),
+            (
+                PendingRendezvousResults::LocalOrRelay,
+                RendezvousResponseKind::Direct,
+                false,
+            ),
+            (
+                PendingRendezvousResults::LocalOrRelay,
+                RendezvousResponseKind::Local,
+                true,
+            ),
+            (
+                PendingRendezvousResults::LocalOrRelay,
+                RendezvousResponseKind::Relay,
+                true,
+            ),
+            (
+                PendingRendezvousResults::RelayOnly,
+                RendezvousResponseKind::Direct,
+                false,
+            ),
+            (
+                PendingRendezvousResults::RelayOnly,
+                RendezvousResponseKind::Local,
+                false,
+            ),
+            (
+                PendingRendezvousResults::RelayOnly,
+                RendezvousResponseKind::Relay,
+                true,
+            ),
+        ];
+
+        for (index, (allowed_results, response_kind, accepted)) in cases.into_iter().enumerate() {
+            let token = Bytes::from(vec![index as u8; RENDEZVOUS_TOKEN_LEN]);
+            let mut pending = HashMap::from([(
+                token.clone(),
+                PendingRendezvous {
+                    requester,
+                    responder_id: "device01".to_owned(),
+                    allowed_results,
+                    relay_server: "relay.example.com:21117".to_owned(),
+                    created_at: now,
+                },
+            )]);
+            let result = consume_pending_rendezvous_in(
+                &mut pending,
+                &token,
+                "device01",
+                requester,
+                response_kind,
+                now,
+            );
+
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "{allowed_results:?} / {response_kind:?}"
+            );
+            assert_eq!(pending.contains_key(&token), !accepted);
+        }
+    }
+
+    #[test]
     fn rendezvous_tokens_are_one_shot_and_bound_to_the_request() {
         let now = Instant::now();
         let requester = SocketAddr::from(([192, 0, 2, 10], 45_000));
@@ -2636,30 +3141,65 @@ mod tests {
             PendingRendezvous {
                 requester,
                 responder_id: "device01".to_owned(),
-                kind: PendingRendezvousKind::Direct,
+                allowed_results: PendingRendezvousResults::DirectOrRelay,
                 relay_server: "relay.example.com:21117".to_owned(),
                 created_at: now,
             },
         )]);
 
+        for (responder_id, claimed_requester, response_kind) in [
+            ("other-device", requester, RendezvousResponseKind::Direct),
+            (
+                "device01",
+                SocketAddr::from(([192, 0, 2, 10], 45_001)),
+                RendezvousResponseKind::Direct,
+            ),
+            ("device01", requester, RendezvousResponseKind::Local),
+        ] {
+            assert!(consume_pending_rendezvous_in(
+                &mut pending,
+                &token,
+                responder_id,
+                claimed_requester,
+                response_kind,
+                now,
+            )
+            .is_err());
+            assert!(pending.contains_key(&token));
+        }
+
+        let missing = Bytes::from(vec![6; RENDEZVOUS_TOKEN_LEN]);
         assert!(consume_pending_rendezvous_in(
             &mut pending,
-            &token,
+            &missing,
             "device01",
             requester,
-            Some(PendingRendezvousKind::Local),
-            now
+            RendezvousResponseKind::Relay,
+            now,
         )
         .is_err());
         assert!(pending.contains_key(&token));
+
+        let malformed = Bytes::from_static(b"short");
+        assert!(consume_pending_rendezvous_in(
+            &mut pending,
+            &malformed,
+            "device01",
+            requester,
+            RendezvousResponseKind::Relay,
+            now,
+        )
+        .is_err());
+        assert!(pending.contains_key(&token));
+
         assert_eq!(
             consume_pending_rendezvous_in(
                 &mut pending,
                 &token,
                 "device01",
                 requester,
-                Some(PendingRendezvousKind::Direct),
-                now
+                RendezvousResponseKind::Relay,
+                now,
             )
             .unwrap(),
             ConsumedRendezvous {
@@ -2673,10 +3213,46 @@ mod tests {
             &token,
             "device01",
             requester,
-            Some(PendingRendezvousKind::Direct),
-            now
+            RendezvousResponseKind::Relay,
+            now,
         )
         .is_err());
+    }
+
+    #[camellia_remote_protocol::tokio::test]
+    async fn concurrent_duplicate_rendezvous_response_consumes_once() {
+        let now = Instant::now();
+        let requester = SocketAddr::from(([192, 0, 2, 10], 45_000));
+        let token = Bytes::from(vec![8; RENDEZVOUS_TOKEN_LEN]);
+        let pending = Arc::new(TokioMutex::new(HashMap::from([(
+            token.clone(),
+            PendingRendezvous {
+                requester,
+                responder_id: "device01".to_owned(),
+                allowed_results: PendingRendezvousResults::DirectOrRelay,
+                relay_server: "relay.example.com:21117".to_owned(),
+                created_at: now,
+            },
+        )])));
+
+        let consume = |pending: Arc<TokioMutex<HashMap<Bytes, PendingRendezvous>>>| {
+            let token = token.clone();
+            async move {
+                let mut pending = pending.lock().await;
+                consume_pending_rendezvous_in(
+                    &mut pending,
+                    &token,
+                    "device01",
+                    requester,
+                    RendezvousResponseKind::Relay,
+                    now,
+                )
+            }
+        };
+        let (first, second) = tokio::join!(consume(pending.clone()), consume(pending.clone()));
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(pending.lock().await.is_empty());
     }
 
     #[test]
@@ -2689,7 +3265,7 @@ mod tests {
             PendingRendezvous {
                 requester,
                 responder_id: "device01".to_owned(),
-                kind: PendingRendezvousKind::Direct,
+                allowed_results: PendingRendezvousResults::DirectOrRelay,
                 relay_server: String::new(),
                 created_at: now - Duration::from_secs(PENDING_RENDEZVOUS_TTL_SECS + 1),
             },
@@ -2700,8 +3276,8 @@ mod tests {
             &token,
             "device01",
             requester,
-            Some(PendingRendezvousKind::Direct),
-            now
+            RendezvousResponseKind::Direct,
+            now,
         )
         .is_err());
         assert!(!pending.contains_key(&token));
@@ -2741,6 +3317,23 @@ mod tests {
             "wrong-key"
         ));
         assert!(!RendezvousServer::http_proxy_authorized(true, "", ""));
+    }
+
+    #[test]
+    fn api_proxy_failures_use_the_typed_error_contract() {
+        for (status, code) in [
+            (403, ErrorCode::PERMISSION_DENIED),
+            (429, ErrorCode::RATE_LIMITED),
+            (502, ErrorCode::HTTP_PROXY_FAILED),
+            (503, ErrorCode::SERVICE_BUSY),
+        ] {
+            let response = http_proxy_error(status, code);
+            assert_eq!(response.status, status);
+            assert!(response.error.is_empty());
+            let typed = response.typed_error.as_ref().expect("typed proxy error");
+            assert!(error::is_valid_for(typed, error::ErrorContext::HttpProxy));
+            assert_eq!(typed.code.enum_value(), Ok(code));
+        }
     }
 
     #[test]
@@ -2790,7 +3383,7 @@ mod tests {
             &first_uuid,
             &first_pk,
             "127.0.0.1",
-            false,
+            None,
         )?;
         assert!(matches!(first, PeerRegistrationStage::Persist(_)));
         assert!(peer.persistence_in_progress);
@@ -2804,7 +3397,7 @@ mod tests {
             &Bytes::from_static(b"competing-device"),
             &Bytes::from(vec![2; PEER_PUBLIC_KEY_LEN]),
             "127.0.0.2",
-            false,
+            None,
         )?;
         assert!(matches!(competing, PeerRegistrationStage::Busy));
         assert_eq!(peer.uuid, first_uuid);
@@ -2813,7 +3406,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_authorization_can_replace_stale_device_identity() -> ResultType<()> {
+    fn static_managed_authorization_cannot_replace_device_identity() -> ResultType<()> {
         let mut peer = Peer::default();
         peer.uuid = Bytes::from_static(b"old-device");
         peer.pk = Bytes::from(vec![1; PEER_PUBLIC_KEY_LEN]);
@@ -2827,11 +3420,35 @@ mod tests {
             &new_uuid,
             &new_pk,
             "127.0.0.2",
-            true,
+            Some(0),
+        )?;
+        assert!(matches!(stage, PeerRegistrationStage::UuidMismatch));
+        assert_eq!(peer.uuid, Bytes::from_static(b"old-device"));
+        assert_eq!(peer.pk, Bytes::from(vec![1; PEER_PUBLIC_KEY_LEN]));
+        Ok(())
+    }
+
+    #[test]
+    fn newer_managed_generation_can_replace_device_identity() -> ResultType<()> {
+        let mut peer = Peer::default();
+        peer.uuid = Bytes::from_static(b"old-device");
+        peer.pk = Bytes::from(vec![1; PEER_PUBLIC_KEY_LEN]);
+        peer.info.ip = "127.0.0.1".to_owned();
+        let new_uuid = Bytes::from_static(b"approved-device");
+        let new_pk = Bytes::from(vec![2; PEER_PUBLIC_KEY_LEN]);
+        let stage = RendezvousServer::stage_peer_registration(
+            &mut peer,
+            "device01",
+            SocketAddr::from(([127, 0, 0, 2], 21116)),
+            &new_uuid,
+            &new_pk,
+            "127.0.0.2",
+            Some(1),
         )?;
         assert!(matches!(stage, PeerRegistrationStage::Persist(_)));
         assert_eq!(peer.uuid, new_uuid);
         assert_eq!(peer.pk, new_pk);
+        assert_eq!(peer.info.deployment_generation, 1);
         Ok(())
     }
 
