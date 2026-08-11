@@ -138,7 +138,7 @@ jobs:
 
   performance-smoke:
     name: Server performance contract smoke
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -147,14 +147,14 @@ jobs:
         with:
           path: candidate
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
       - name: Checkout exact control
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: control
           persist-credentials: false
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           submodules: recursive
       - name: Install exact toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # zizmor: ignore[superfluous-actions]
@@ -165,8 +165,12 @@ jobs:
         working-directory: candidate/libs/camellia_remote_protocol
       - name: Build and compare production parser observations
         env:
-          CANDIDATE_REVISION: ${{ github.event.pull_request.head.sha }}
-          CONTROL_REVISION: ${{ github.event.pull_request.base.sha }}
+          CANDIDATE_REVISION: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          CONTROL_REVISION: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          PERFORMANCE_ITERATIONS: ${{ github.event_name == 'pull_request' && '5' || '15' }}
+          PERFORMANCE_POLICY: ${{ github.event_name == 'pull_request' && 'performance/server-trusted-proxy-v1.json' || 'performance/server-trusted-proxy-v1.scheduled.json' }}
+          PERFORMANCE_TIER: ${{ github.event_name == 'pull_request' && 'pr-smoke' || 'scheduled' }}
+          PERFORMANCE_WORK_SECONDS: ${{ github.event_name == 'push' && '5' || '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -186,15 +190,20 @@ jobs:
           install -m 0755 \
             "$RUNNER_TEMP/server-performance-target/release/examples/performance_observation" \
             "$RUNNER_TEMP/server-candidate-observation"
+          if [[ -n "$PERFORMANCE_WORK_SECONDS" ]]; then
+            export CAMELLIA_PERFORMANCE_WORK_SECONDS="$PERFORMANCE_WORK_SECONDS"
+          else
+            unset CAMELLIA_PERFORMANCE_WORK_SECONDS
+          fi
           python3 candidate/libs/camellia_remote_protocol/tools/performance_contract.py collect-pair \
             --repository remote-server \
             --control-revision "$CONTROL_REVISION" \
             --candidate-revision "$CANDIDATE_REVISION" \
             --scenario server-trusted-proxy-v1 \
-            --tier pr-smoke \
+            --tier "$PERFORMANCE_TIER" \
             --runner-class github-ubuntu-24.04-x64 \
             --toolchain rust-1.97.1 \
-            --iterations 5 --warmups 1 --timeout-seconds 30 \
+            --iterations "$PERFORMANCE_ITERATIONS" --warmups 1 --timeout-seconds 30 \
             --control-output "$RUNNER_TEMP/server-control-performance.json" \
             --candidate-output "$RUNNER_TEMP/server-candidate-performance.json" \
             -- "$RUNNER_TEMP/server-control-observation" \
@@ -202,13 +211,13 @@ jobs:
           python3 candidate/libs/camellia_remote_protocol/tools/performance_contract.py compare \
             "$RUNNER_TEMP/server-control-performance.json" \
             "$RUNNER_TEMP/server-candidate-performance.json" \
-            candidate/performance/server-trusted-proxy-v1.json \
+            "candidate/$PERFORMANCE_POLICY" \
             --output "$RUNNER_TEMP/server-performance-comparison.json"
       - name: Upload bounded performance evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: server-performance-${{ github.event.pull_request.head.sha }}
+          name: server-performance-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           path: |
             ${{ runner.temp }}/server-control-performance.json
             ${{ runner.temp }}/server-candidate-performance.json
@@ -253,9 +262,18 @@ jobs:
               echo "Dependency review must succeed, got: $DEPENDENCY_REVIEW_RESULT" >&2
               exit 1
             }
+          elif [[ "$EVENT_NAME" == push ]]; then
+            [[ "$PERFORMANCE_SMOKE_RESULT" == success ]] || {
+              echo "Performance smoke must succeed on main pushes, got: $PERFORMANCE_SMOKE_RESULT" >&2
+              exit 1
+            }
+            [[ "$DEPENDENCY_REVIEW_RESULT" == skipped ]] || {
+              echo "Dependency review must be skipped outside pull requests, got: $DEPENDENCY_REVIEW_RESULT" >&2
+              exit 1
+            }
           else
             [[ "$PERFORMANCE_SMOKE_RESULT" == skipped ]] || {
-              echo "Performance smoke must be skipped outside pull requests, got: $PERFORMANCE_SMOKE_RESULT" >&2
+              echo "Performance smoke must be skipped outside pull requests and main pushes, got: $PERFORMANCE_SMOKE_RESULT" >&2
               exit 1
             }
             [[ "$DEPENDENCY_REVIEW_RESULT" == skipped ]] || {
