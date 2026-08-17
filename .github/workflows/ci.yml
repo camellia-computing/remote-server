@@ -45,7 +45,7 @@ jobs:
         with:
           toolchain: 1.97.1
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2.8.2
       - name: Validate release metadata
         run: |
           python3 scripts/test_release_metadata.py
@@ -75,7 +75,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Audit workflow security
-        uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
         with:
           inputs: .github
           online-audits: false
