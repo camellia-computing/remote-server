@@ -87,6 +87,7 @@ jobs:
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Validate release state machines
         run: |
+          python3 .github/scripts/test_dynamic_boundary_policy.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
           bash .github/scripts/tests/test_resolve_container_registries.sh
