@@ -45,7 +45,7 @@ jobs:
         with:
           toolchain: 1.97.1
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.8.2
       - name: Validate release metadata
         run: |
           python3 scripts/test_release_metadata.py
@@ -75,7 +75,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Audit workflow security
-        uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
+        uses: zizmorcore/zizmor-action@70fb788f84895a7701f5643d103d587e460b5c99 # v0.6.3
         with:
           inputs: .github
           online-audits: false
@@ -102,7 +102,7 @@ jobs:
           CAMELLIA_REMOTE_RELAY_ADDRESS: relay.example.com:21117
           CAMELLIA_REMOTE_SERVER_IMAGE: ghcr.io/example/remote-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         run: docker compose config --quiet
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.0.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.0.0
       - name: Resolve image version
         id: metadata
         run: python3 scripts/release_metadata.py --github-output
