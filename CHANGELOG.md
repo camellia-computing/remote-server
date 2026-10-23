@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.2] - 2026-10-23
+
+### Fixes
+
+- fix(deps): patch TLS and QUIC dependencies and refresh CI actions (#50) (`9b78c054bd27`)
+
+### Other changes
+
+- deps: update server runtime dependencies (#24) (`b886c37ece7d`)
+
 ## [1.0.1] - 2026-08-01
 
 ### Fixes
