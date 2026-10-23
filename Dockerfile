@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.97.1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
+FROM rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS builder
 
 WORKDIR /build
 COPY . .
@@ -9,7 +9,7 @@ RUN cargo build --locked --release --bins \
     && install -Dm0755 target/release/camellia-remote-relay /out/camellia-remote-relay \
     && install -Dm0755 target/release/camellia-remote-utils /out/camellia-remote-utils
 
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 
 ARG VERSION
 ARG REVISION

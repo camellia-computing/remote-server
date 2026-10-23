@@ -1523,7 +1523,7 @@ impl RendezvousServer {
         if base.is_empty() {
             bail!("API server is not configured");
         }
-        let public_key_hash = format!("{:x}", Sha256::digest(public_key));
+        let public_key_hash = hex::encode(Sha256::digest(public_key));
         let response = self
             .inner
             .http_client
