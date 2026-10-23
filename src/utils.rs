@@ -133,7 +133,7 @@ fn doctor(server_address_unclean: &str) -> ResultType<()> {
         }
     } else {
         // the passed string is not an ip address
-        let ips: Vec<std::net::IpAddr> = lookup_host(server_address)?;
+        let ips: Vec<std::net::IpAddr> = lookup_host(server_address)?.collect();
         if ips.is_empty() {
             bail!("No IP addresses resolved for {server_address}");
         }
