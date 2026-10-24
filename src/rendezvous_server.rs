@@ -11,7 +11,7 @@ use camellia_remote_protocol::{
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
     protobuf::{Message as _, MessageField},
-    rand::{rngs::OsRng, RngCore},
+    rand::{rngs::SysRng, TryRng},
     rendezvous_proto::{
         register_pk_response::Result::{INVALID_ID_FORMAT, TOO_FREQUENT, UUID_MISMATCH},
         *,
@@ -1236,7 +1236,7 @@ impl RendezvousServer {
         }
         loop {
             let mut token_bytes = [0u8; RENDEZVOUS_TOKEN_LEN];
-            OsRng.fill_bytes(&mut token_bytes);
+            SysRng.try_fill_bytes(&mut token_bytes)?;
             let token = Bytes::copy_from_slice(&token_bytes);
             if !pending.contains_key(&token) {
                 pending.insert(
