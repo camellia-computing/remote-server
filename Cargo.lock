@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "camellia-remote-server"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-speed-limit",
  "async-trait",
