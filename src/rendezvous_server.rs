@@ -419,6 +419,7 @@ impl RendezvousServer {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(HTTP_PROXY_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()?;
         log::info!("api_server: {}", api_server);
         let trust_proxy_headers = crate::common::get_yes_no_arg("trust-proxy-headers", false)?;
@@ -1590,6 +1591,8 @@ impl RendezvousServer {
                 | "accept-language"
                 | "authorization"
                 | "content-type"
+                | "idempotency-key"
+                | "if-match"
                 | "if-modified-since"
                 | "if-none-match"
                 | "range"
@@ -1613,6 +1616,28 @@ impl RendezvousServer {
                 | "host"
                 | "content-length"
         )
+    }
+
+    fn http_proxy_request_headers(
+        entries: Vec<HeaderEntry>,
+    ) -> ResultType<reqwest::header::HeaderMap> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for entry in entries {
+            if !Self::is_allowed_http_proxy_request_header(&entry.name) {
+                continue;
+            }
+            let name = reqwest::header::HeaderName::from_bytes(entry.name.as_bytes())?;
+            let value = reqwest::header::HeaderValue::from_str(&entry.value)?;
+            if matches!(
+                name.as_str(),
+                "authorization" | "content-type" | "idempotency-key" | "if-match"
+            ) && headers.contains_key(&name)
+            {
+                bail!("HTTP proxy has duplicate singleton request headers");
+            }
+            headers.append(name, value);
+        }
+        Ok(headers)
     }
 
     fn http_proxy_method(method: &str) -> ResultType<reqwest::Method> {
@@ -1659,15 +1684,8 @@ impl RendezvousServer {
             bail!("API server is not configured");
         }
         let url = format!("{}{}", base, req.path);
-        let mut builder = self.inner.http_client.request(method, url);
-        for entry in req.headers {
-            if !Self::is_allowed_http_proxy_request_header(&entry.name) {
-                continue;
-            }
-            let name = reqwest::header::HeaderName::from_bytes(entry.name.as_bytes())?;
-            let value = reqwest::header::HeaderValue::from_str(&entry.value)?;
-            builder = builder.header(name, value);
-        }
+        let headers = Self::http_proxy_request_headers(req.headers)?;
+        let mut builder = self.inner.http_client.request(method, url).headers(headers);
         builder = builder
             // The protobuf consumer expects a textual API response. Do not let
             // an upstream representation silently become compressed bytes.
@@ -2859,6 +2877,68 @@ mod tests {
                 RendezvousServer::validate_http_proxy_path(path).is_err(),
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn api_proxy_preserves_mandatory_management_mutation_and_receipt_contract() {
+        for name in ["Idempotency-Key", "idempotency-key", "If-Match", "IF-MATCH"] {
+            assert!(
+                RendezvousServer::is_allowed_http_proxy_request_header(name),
+                "{name}"
+            );
+        }
+        for path in [
+            "/api/ab/peer/add/personal-7",
+            "/api/ab/peer/update/personal-7",
+            "/api/ab/peer/personal-7",
+            "/api/ab/tag/add/personal-7",
+            "/api/ab/tag/rename/personal-7",
+            "/api/ab/tag/update/personal-7",
+            "/api/ab/tag/personal-7",
+            "/api/management-operations/03440000-0000-4000-8000-000000000001",
+        ] {
+            assert!(
+                RendezvousServer::validate_http_proxy_path(path).is_ok(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_proxy_forwards_exact_versions_and_ids_but_rejects_ambiguous_singletons() {
+        let entry = |name: &str, value: &str| HeaderEntry {
+            name: name.to_owned(),
+            value: value.to_owned(),
+            ..Default::default()
+        };
+        let operation = "03440000-0000-4000-8000-000000000001";
+        let headers = RendezvousServer::http_proxy_request_headers(vec![
+            entry("Idempotency-Key", operation),
+            entry("If-Match", "\"7\""),
+            entry("Authorization", "Bearer test-only"),
+            entry("Host", "untrusted.invalid"),
+            entry("X-Forwarded-For", "untrusted-ip"),
+            entry("Proxy-Authorization", "untrusted-proxy-token"),
+        ])
+        .unwrap();
+        assert_eq!(headers["idempotency-key"], operation);
+        assert_eq!(headers["if-match"], "\"7\"");
+        assert_eq!(headers["authorization"], "Bearer test-only");
+        assert_eq!(headers.len(), 3);
+        for (first, second) in [
+            ("Idempotency-Key", "IDEMPOTENCY-KEY"),
+            ("If-Match", "if-match"),
+            ("Authorization", "authorization"),
+            ("Content-Type", "CONTENT-TYPE"),
+        ] {
+            let error = RendezvousServer::http_proxy_request_headers(vec![
+                entry(first, "PRIVATE-FIRST"),
+                entry(second, "PRIVATE-SECOND"),
+            ])
+            .unwrap_err()
+            .to_string();
+            assert_eq!(error, "HTTP proxy has duplicate singleton request headers");
         }
     }
 
