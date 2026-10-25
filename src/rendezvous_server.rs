@@ -5,6 +5,7 @@ use camellia_remote_protocol::anyhow::{anyhow, Context as _};
 use camellia_remote_protocol::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
+    bytes_codec::BytesCodec,
     config,
     crypto::{box_, secretbox, sign},
     futures::future::join_all,
@@ -17,7 +18,7 @@ use camellia_remote_protocol::{
         *,
     },
     sha2::{Digest, Sha256},
-    tcp::{Encrypt, FramedStream},
+    tcp::{CipherRole, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -419,6 +420,7 @@ impl RendezvousServer {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(HTTP_PROXY_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()?;
         log::info!("api_server: {}", api_server);
         let trust_proxy_headers = crate::common::get_yes_no_arg("trust-proxy-headers", false)?;
@@ -1590,6 +1592,8 @@ impl RendezvousServer {
                 | "accept-language"
                 | "authorization"
                 | "content-type"
+                | "idempotency-key"
+                | "if-match"
                 | "if-modified-since"
                 | "if-none-match"
                 | "range"
@@ -1613,6 +1617,28 @@ impl RendezvousServer {
                 | "host"
                 | "content-length"
         )
+    }
+
+    fn http_proxy_request_headers(
+        entries: Vec<HeaderEntry>,
+    ) -> ResultType<reqwest::header::HeaderMap> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for entry in entries {
+            if !Self::is_allowed_http_proxy_request_header(&entry.name) {
+                continue;
+            }
+            let name = reqwest::header::HeaderName::from_bytes(entry.name.as_bytes())?;
+            let value = reqwest::header::HeaderValue::from_str(&entry.value)?;
+            if matches!(
+                name.as_str(),
+                "authorization" | "content-type" | "idempotency-key" | "if-match"
+            ) && headers.contains_key(&name)
+            {
+                bail!("HTTP proxy has duplicate singleton request headers");
+            }
+            headers.append(name, value);
+        }
+        Ok(headers)
     }
 
     fn http_proxy_method(method: &str) -> ResultType<reqwest::Method> {
@@ -1659,15 +1685,8 @@ impl RendezvousServer {
             bail!("API server is not configured");
         }
         let url = format!("{}{}", base, req.path);
-        let mut builder = self.inner.http_client.request(method, url);
-        for entry in req.headers {
-            if !Self::is_allowed_http_proxy_request_header(&entry.name) {
-                continue;
-            }
-            let name = reqwest::header::HeaderName::from_bytes(entry.name.as_bytes())?;
-            let value = reqwest::header::HeaderValue::from_str(&entry.value)?;
-            builder = builder.header(name, value);
-        }
+        let headers = Self::http_proxy_request_headers(req.headers)?;
+        let mut builder = self.inner.http_client.request(method, url).headers(headers);
         builder = builder
             // The protobuf consumer expects a textual API response. Do not let
             // an upstream representation silently become compressed bytes.
@@ -2091,9 +2110,7 @@ impl RendezvousServer {
             return;
         }
         let mut stream = FramedStream::from(stream, addr);
-        stream
-            .codec_mut()
-            .set_max_packet_length(RENDEZVOUS_CONTROL_FRAME_MAX);
+        *stream.codec_mut() = BytesCodec::with_max_packet_length(RENDEZVOUS_CONTROL_FRAME_MAX);
         tokio::spawn(async move {
             let _permit = permit;
             let mut stream = stream;
@@ -2174,19 +2191,8 @@ impl RendezvousServer {
             bail!("Invalid rendezvous key exchange response");
         }
 
-        let client_pk = box_::PublicKey::from_slice(&ex.keys[0])
-            .ok_or_else(|| anyhow!("Invalid rendezvous client public key"))?;
-        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
-        let symmetric = box_::open(ex.keys[1].as_ref(), &nonce, &client_pk, &tmp_sk)
-            .map_err(|_| anyhow!("Unable to decrypt rendezvous session key"))?;
-        if symmetric.len() != secretbox::KEYBYTES {
-            bail!("Invalid rendezvous session key length");
-        }
-
-        let mut bytes = [0u8; secretbox::KEYBYTES];
-        bytes.copy_from_slice(&symmetric);
-        let key = secretbox::Key(bytes);
-        stream.set_key(key.clone());
+        let key = Self::decode_session_key(&ex, &tmp_sk)?;
+        stream.set_key(key.clone(), CipherRole::Responder);
         if !stream.is_secured() {
             bail!("Rendezvous stream did not enter encrypted mode");
         }
@@ -2248,19 +2254,20 @@ impl RendezvousServer {
             bail!("Invalid rendezvous WebSocket key exchange response");
         }
 
-        let client_pk = box_::PublicKey::from_slice(&ex.keys[0])
-            .ok_or_else(|| anyhow!("Invalid rendezvous WebSocket client public key"))?;
-        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
-        let symmetric = box_::open(ex.keys[1].as_ref(), &nonce, &client_pk, &tmp_sk)
-            .map_err(|_| anyhow!("Unable to decrypt rendezvous WebSocket session key"))?;
-        if symmetric.len() != secretbox::KEYBYTES {
-            bail!("Invalid rendezvous WebSocket session key length");
-        }
-
-        let mut bytes = [0u8; secretbox::KEYBYTES];
-        bytes.copy_from_slice(&symmetric);
+        let key = Self::decode_session_key(&ex, &tmp_sk)?;
         log::debug!("Rendezvous WebSocket secure channel established");
-        Ok(secretbox::Key(bytes))
+        Ok(key)
+    }
+
+    fn decode_session_key(
+        exchange: &KeyExchange,
+        secret: &box_::SecretKey,
+    ) -> ResultType<secretbox::Key> {
+        if exchange.keys.len() != 2 || exchange.keys[0].len() != box_::PUBLICKEYBYTES {
+            bail!("Invalid rendezvous session key exchange");
+        }
+        Encrypt::decode(&exchange.keys[1], &exchange.keys[0], secret)
+            .map_err(|_| anyhow!("Invalid rendezvous session cipher envelope"))
     }
 
     // Tungstenite requires its server callback to return a full HTTP response on
@@ -2329,8 +2336,8 @@ impl RendezvousServer {
             let ws_key = self.attempt_handshake_ws(&mut ws_stream).await?;
             let (mut ws_sink, mut ws_stream) = ws_stream.split();
             let secretbox::Key(bytes) = ws_key;
-            let mut ws_encrypt_in = Encrypt::new(secretbox::Key(bytes));
-            let ws_encrypt_out = Encrypt::new(secretbox::Key(bytes));
+            let mut ws_encrypt_in = Encrypt::new(secretbox::Key(bytes), CipherRole::Responder);
+            let ws_encrypt_out = Encrypt::new(secretbox::Key(bytes), CipherRole::Responder);
 
             // bridge a rendezvous message channel to websocket sink (binary)
             let (tx, mut rx) =
@@ -2401,9 +2408,7 @@ impl RendezvousServer {
             // to initiate the secure handshake. This avoids a deadlock where both
             // client and server are waiting for each other.
             let mut stream = FramedStream::from(stream, addr);
-            stream
-                .codec_mut()
-                .set_max_packet_length(RENDEZVOUS_CONTROL_FRAME_MAX);
+            *stream.codec_mut() = BytesCodec::with_max_packet_length(RENDEZVOUS_CONTROL_FRAME_MAX);
 
             let _session_key = self.attempt_handshake(&mut stream).await?;
             let (tx, mut rx) =
@@ -2602,6 +2607,62 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sealed_exchange(envelope: &[u8], public: &box_::PublicKey) -> KeyExchange {
+        let (client_public, client_secret) = box_::gen_keypair();
+        KeyExchange {
+            keys: vec![
+                client_public.0.to_vec().into(),
+                box_::seal(
+                    envelope,
+                    &box_::Nonce([0; box_::NONCEBYTES]),
+                    public,
+                    &client_secret,
+                )
+                .unwrap()
+                .into(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rendezvous_cipher_accepts_current_version_with_responder_direction() {
+        let (public, secret) = box_::gen_keypair();
+        let original = secretbox::Key([7; secretbox::KEYBYTES]);
+        let exchange = sealed_exchange(&Encrypt::encode_session_key(&original), &public);
+        let decoded = RendezvousServer::decode_session_key(&exchange, &secret).unwrap();
+        assert_eq!(decoded.0, original.0);
+        let mut client = Encrypt::new(original, CipherRole::Initiator);
+        // WebSocket ingress/egress are separate objects with the same server role.
+        let mut ingress = Encrypt::new(decoded.clone(), CipherRole::Responder);
+        let mut egress = Encrypt::new(decoded, CipherRole::Responder);
+        let message = b"mandatory-proxy-request";
+        let mut request = BytesMut::from(client.enc(message).unwrap().as_slice());
+        let mut response = BytesMut::from(egress.enc(message).unwrap().as_slice());
+        assert_ne!(request, response);
+        ingress.dec(&mut request).unwrap();
+        client.dec(&mut response).unwrap();
+        assert_eq!(request.as_ref(), message);
+        assert_eq!(response.as_ref(), message);
+    }
+
+    #[test]
+    fn rendezvous_cipher_rejects_legacy_unknown_and_malformed_envelopes() {
+        let (public, secret) = box_::gen_keypair();
+        let original = secretbox::Key([7; secretbox::KEYBYTES]);
+        let mut unknown = Encrypt::encode_session_key(&original);
+        unknown[0] = 255;
+        for envelope in [vec![], original.0.to_vec(), unknown] {
+            let exchange = sealed_exchange(&envelope, &public);
+            assert!(RendezvousServer::decode_session_key(&exchange, &secret).is_err());
+        }
+        let mut exchange = sealed_exchange(&Encrypt::encode_session_key(&original), &public);
+        exchange.keys.push(Bytes::new());
+        assert!(RendezvousServer::decode_session_key(&exchange, &secret).is_err());
+        exchange.keys.clear();
+        assert!(RendezvousServer::decode_session_key(&exchange, &secret).is_err());
+    }
 
     #[test]
     fn peer_ids_are_bounded_and_canonical() {
@@ -2859,6 +2920,68 @@ mod tests {
                 RendezvousServer::validate_http_proxy_path(path).is_err(),
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn api_proxy_preserves_mandatory_management_mutation_and_receipt_contract() {
+        for name in ["Idempotency-Key", "idempotency-key", "If-Match", "IF-MATCH"] {
+            assert!(
+                RendezvousServer::is_allowed_http_proxy_request_header(name),
+                "{name}"
+            );
+        }
+        for path in [
+            "/api/ab/peer/add/personal-7",
+            "/api/ab/peer/update/personal-7",
+            "/api/ab/peer/personal-7",
+            "/api/ab/tag/add/personal-7",
+            "/api/ab/tag/rename/personal-7",
+            "/api/ab/tag/update/personal-7",
+            "/api/ab/tag/personal-7",
+            "/api/management-operations/03440000-0000-4000-8000-000000000001",
+        ] {
+            assert!(
+                RendezvousServer::validate_http_proxy_path(path).is_ok(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_proxy_forwards_exact_versions_and_ids_but_rejects_ambiguous_singletons() {
+        let entry = |name: &str, value: &str| HeaderEntry {
+            name: name.to_owned(),
+            value: value.to_owned(),
+            ..Default::default()
+        };
+        let operation = "03440000-0000-4000-8000-000000000001";
+        let headers = RendezvousServer::http_proxy_request_headers(vec![
+            entry("Idempotency-Key", operation),
+            entry("If-Match", "\"7\""),
+            entry("Authorization", "Bearer test-only"),
+            entry("Host", "untrusted.invalid"),
+            entry("X-Forwarded-For", "untrusted-ip"),
+            entry("Proxy-Authorization", "untrusted-proxy-token"),
+        ])
+        .unwrap();
+        assert_eq!(headers["idempotency-key"], operation);
+        assert_eq!(headers["if-match"], "\"7\"");
+        assert_eq!(headers["authorization"], "Bearer test-only");
+        assert_eq!(headers.len(), 3);
+        for (first, second) in [
+            ("Idempotency-Key", "IDEMPOTENCY-KEY"),
+            ("If-Match", "if-match"),
+            ("Authorization", "authorization"),
+            ("Content-Type", "CONTENT-TYPE"),
+        ] {
+            let error = RendezvousServer::http_proxy_request_headers(vec![
+                entry(first, "PRIVATE-FIRST"),
+                entry(second, "PRIVATE-SECOND"),
+            ])
+            .unwrap_err()
+            .to_string();
+            assert_eq!(error, "HTTP proxy has duplicate singleton request headers");
         }
     }
 
