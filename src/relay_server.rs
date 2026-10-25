@@ -6,6 +6,7 @@ use camellia_remote_protocol::{
     anyhow::Context as _,
     bail,
     bytes::{Bytes, BytesMut},
+    bytes_codec::BytesCodec,
     crypto::sign,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
@@ -673,9 +674,7 @@ async fn make_pair(
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
         let mut stream = FramedStream::from(stream, addr);
-        stream
-            .codec_mut()
-            .set_max_packet_length(RELAY_CONTROL_FRAME_MAX);
+        *stream.codec_mut() = BytesCodec::with_max_packet_length(RELAY_CONTROL_FRAME_MAX);
         make_pair_(stream, addr, key, limiter).await;
     }
     Ok(())

@@ -9,7 +9,7 @@ const MAX_RUNTIME_MS: u128 = 10_000;
 fn malformed_rendezvous_corpus_is_panic_free_and_bounded() {
     let started = Instant::now();
     for index in 0..ITERATIONS {
-        let mut state = 0x7265_6c61_79_2d_32_30u64.wrapping_add(index as u64);
+        let mut state = 0x7265_6c61_792d_3230_u64.wrapping_add(index as u64);
         let len = (state as usize % MAX_INPUT).min(MAX_INPUT);
         let mut input = Vec::with_capacity(len);
         for _ in 0..len {
