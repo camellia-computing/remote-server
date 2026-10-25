@@ -273,7 +273,6 @@ dependencies = [
  "confy",
  "crypto_box",
  "crypto_secretbox",
- "default_net",
  "directories-next",
  "dirs-next",
  "ed25519-dalek",
@@ -814,16 +813,6 @@ name = "deadpool-runtime"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2657f61fb1dd8bf37a8d51093cc7cee4e77125b22f7753f49b289f831bec2bae"
-
-[[package]]
-name = "default_net"
-version = "0.1.0"
-source = "git+https://github.com/rustdesk-org/default_net?rev=78f8f70cd85151a3a2c4a3230d80d5272703c02e#78f8f70cd85151a3a2c4a3230d80d5272703c02e"
-dependencies = [
- "anyhow",
- "regex",
- "winapi",
-]
 
 [[package]]
 name = "defmt"

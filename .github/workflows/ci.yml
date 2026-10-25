@@ -52,6 +52,7 @@ jobs:
           python3 scripts/test_source_provenance.py
           python3 scripts/release_metadata.py
           python3 scripts/validate_source_provenance.py
+          python3 libs/camellia_remote_protocol/scripts/check_dependency_licenses.py
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
